@@ -13695,6 +13695,515 @@ ${this._renderExcludedEntities(d)}
   }
 }
 
+// ═══ LAYOUT EDITOR (dthomas946 fork) ═════════════════════════════════════════
+// Rearrange the panel: drag sections into a new order within their group, hide
+// sections or whole tabs, reorder tabs. Saved to JARVIS config ("panel_layout")
+// so it follows you across devices, with a localStorage copy for instant load.
+//
+// Self-contained on purpose: it only wraps JarvisPanel.prototype._render and
+// works on the rendered DOM (sections are matched by their heading text), so
+// upstream changes to section contents merge cleanly. Moving DOM nodes keeps
+// their event listeners, so drill-downs (area tiles, settings sub-nav, …) keep
+// working.
+(() => {
+  if (typeof JarvisPanel === "undefined" || JarvisPanel.prototype._jlInstalled) return;
+  const P = JarvisPanel.prototype;
+  P._jlInstalled = true;
+
+  const LS_KEY = "jarvis_panel_layout";
+  const SKIP_CLASS = /(^|\s)[\w-]*(modal|overlay|backdrop|toast|popup|drawer|lightbox|dialog|sheet)[\w-]*(\s|$)/;
+  const UNHIDEABLE_TABS = new Set(["settings"]);
+  // Column widths for the Command Center top grid, so a box keeps its own
+  // width when it moves (the stylesheet fixes the tracks as 240px 1fr 300px).
+  const GRID_TRACKS = { "c-status": "240px", "c-camera": "minmax(0, 1fr)", "c-log": "300px" };
+
+  const emptyLayout = () => ({ v: 1, tabs: { order: [], hidden: [] }, sections: {} });
+
+  const norm = (s) => String(s || "")
+    .toLowerCase()
+    .replace(/[0-9]+/g, " ")
+    .replace(/[^a-zÀ-ɏ ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 48);
+
+  const cls = (el) => Array.from(el.classList)
+    .filter((c) => !c.startsWith("jl-") && c !== "active" && c !== "on")
+    .sort().join(".");
+
+  // ── load / save ────────────────────────────────────────────────────────────
+  P._jlLoad = function () {
+    const server = this._liveData?.config?.panel_layout;
+    if (server && typeof server === "object" && server.v) {
+      if (!this._jlFromServer) {
+        this._layout = server;
+        this._jlFromServer = true;
+        try { localStorage.setItem(LS_KEY, JSON.stringify(server)); } catch (_) { /* private mode */ }
+      }
+      return this._layout;
+    }
+    if (!this._layout) {
+      try { this._layout = JSON.parse(localStorage.getItem(LS_KEY) || "null"); } catch (_) { this._layout = null; }
+      if (!this._layout || !this._layout.v) this._layout = emptyLayout();
+    }
+    return this._layout;
+  };
+
+  P._jlSave = function () {
+    const layout = this._layout || emptyLayout();
+    try { localStorage.setItem(LS_KEY, JSON.stringify(layout)); } catch (_) { /* private mode */ }
+    if (this._liveData?.config) this._liveData.config.panel_layout = layout;
+    clearTimeout(this._jlSaveTimer);
+    this._jlSaveTimer = setTimeout(async () => {
+      if (!this._hass) return;
+      try {
+        await this._hass.callWS({ type: "jarvis/update_config", key: "panel_layout", value: layout });
+        if (typeof this._toast === "function") this._toast("✓ Layout saved", "ok");
+      } catch (err) {
+        if (typeof this._toast === "function") this._toast(`✗ Layout not saved — ${err?.message || err}`, "err");
+      }
+    }, 500);
+  };
+
+  // ── render hook ────────────────────────────────────────────────────────────
+  const origRender = P._render;
+  P._render = function () {
+    // A live-data refresh mid-drag would rebuild the DOM under the cursor.
+    if (this._jlDragging) { this._pendingRender = true; return; }
+    origRender.call(this);
+    try { this._jlApply(); } catch (err) { console.warn("JARVIS layout: apply failed", err); }
+  };
+
+  // ── discovery ──────────────────────────────────────────────────────────────
+  P._jlIsSection = function (el) {
+    if (!(el instanceof HTMLElement)) return false;
+    if (/^(STYLE|SCRIPT|TEMPLATE|LINK)$/.test(el.tagName)) return false;
+    if (el.classList.contains("jl-bar") || el.classList.contains("jl-tools")) return false;
+    if (SKIP_CLASS.test(el.className || "")) return false;
+    return true;
+  };
+
+  P._jlSectionKey = function (el, seen) {
+    let key = el.dataset.jlKey;
+    if (!key) {
+      // The heading's first span is the title; later spans are live counters
+      // ("16 Registered", "◉ LIVE") that would make the key drift.
+      const head = el.querySelector(":scope > .head > span") || el.querySelector(":scope > .head");
+      key = el.id ? `#${el.id}` : (head && norm(head.textContent)) || cls(el) || el.tagName.toLowerCase();
+      el.dataset.jlBase = key;
+    }
+    key = el.dataset.jlBase || key;
+    const n = (seen.get(key) || 0) + 1;
+    seen.set(key, n);
+    const full = n > 1 ? `${key}#${n}` : key;
+    el.dataset.jlKey = full;
+    return full;
+  };
+
+  // Groups: the tab's top-level blocks, plus every container that holds .panel
+  // boxes. Sections only move within their own group, so each layout's CSS
+  // (stack, grid, columns) stays valid.
+  P._jlGroups = function (app) {
+    const groups = [];
+    const tabBar = app.querySelector(":scope > .tab-bar");
+    const top = [];
+    let after = !tabBar;
+    for (const c of Array.from(app.children)) {
+      if (c === tabBar) { after = true; continue; }
+      if (after && this._jlIsSection(c)) top.push(c);
+    }
+    if (top.length) groups.push({ container: app, key: "top", items: top });
+
+    const parents = new Map();
+    app.querySelectorAll(".panel").forEach((p) => {
+      const parent = p.parentElement;
+      if (!parent || parent === app || !this._jlIsSection(p)) return;
+      if (p.closest("[class*='overlay'], [class*='modal']")) return;
+      if (!parents.has(parent)) parents.set(parent, []);
+      parents.get(parent).push(p);
+    });
+    const seenContainers = new Map();
+    for (const [parent, items] of parents) {
+      let ck = parent.id ? `#${parent.id}` : (cls(parent) || parent.tagName.toLowerCase());
+      const n = (seenContainers.get(ck) || 0) + 1;
+      seenContainers.set(ck, n);
+      if (n > 1) ck = `${ck}#${n}`;
+      groups.push({ container: parent, key: ck, items });
+    }
+    return groups;
+  };
+
+  // ── apply ──────────────────────────────────────────────────────────────────
+  P._jlApply = function () {
+    const root = this.shadowRoot;
+    const app = root && root.querySelector(".app");
+    if (!app) return;
+    const layout = this._jlLoad();
+    this._jlEnsureStyles();
+    this._jlApplyTabs(app, layout);
+
+    const tab = this._currentTab || "dashboard";
+    const editing = !!this._layoutEditing;
+    app.classList.toggle("jl-editing", editing);
+
+    this._jlApplying = true;
+    try {
+      for (const g of this._jlGroups(app)) {
+        const gk = `${tab}|${g.key}`;
+        const seen = new Map();
+        const keyed = g.items.map((el) => ({ el, key: this._jlSectionKey(el, seen) }));
+        const saved = layout.sections[gk] || { order: [], hidden: [] };
+
+        // Order: saved keys first, in saved order; sections the layout has
+        // never seen stay next to the known section that preceded them.
+        let last = -1;
+        const ranked = keyed.map((it, i) => {
+          const idx = saved.order.indexOf(it.key);
+          const rank = idx >= 0 ? idx : last + 0.001 * (i + 1);
+          if (idx >= 0) last = idx;
+          return { ...it, rank };
+        });
+        const sorted = [...ranked].sort((a, b) => a.rank - b.rank);
+        if (sorted.some((it, i) => it.el !== keyed[i].el)) {
+          // Swap into the slots the sections occupy, so non-section siblings
+          // (headers, sub-navs) stay where they are.
+          const markers = keyed.map((it) => {
+            const m = document.createComment("jl");
+            it.el.parentNode.insertBefore(m, it.el);
+            return m;
+          });
+          markers.forEach((m, i) => { m.parentNode.replaceChild(sorted[i].el, m); });
+        }
+
+        const hidden = new Set(saved.hidden || []);
+        for (const it of keyed) {
+          const isHidden = hidden.has(it.key);
+          it.el.classList.toggle("jl-hidden", isHidden && !editing);
+          it.el.classList.toggle("jl-dim", isHidden && editing);
+          it.el.classList.toggle("jl-sec", editing);
+          it.el._jlGroup = gk;
+          if (editing) this._jlAddTools(it.el, gk, isHidden);
+        }
+        this._jlGridTracks(g.container);
+      }
+    } finally {
+      this._jlApplying = false;
+    }
+
+    if (editing) this._jlAddBar(app);
+    this._jlWatch(app);
+  };
+
+  // Keep the top grid's column widths attached to the boxes that own them.
+  P._jlGridTracks = function (container) {
+    if (!container.classList || !container.classList.contains("grid")) return;
+    const kids = Array.from(container.children).filter((c) =>
+      !c.classList.contains("jl-hidden") && !c.classList.contains("jl-tools"));
+    const tracks = kids.map((c) => {
+      const k = Object.keys(GRID_TRACKS).find((name) => c.classList.contains(name));
+      return k ? GRID_TRACKS[k] : null;
+    });
+    if (tracks.every(Boolean) && tracks.length) {
+      container.style.setProperty("--jl-cols", tracks.join(" "));
+      container.classList.add("jl-cols");
+    } else {
+      container.classList.remove("jl-cols");
+    }
+  };
+
+  P._jlApplyTabs = function (app, layout) {
+    const bar = app.querySelector(":scope > .tab-bar");
+    if (!bar) return;
+    const tabs = Array.from(bar.querySelectorAll(":scope > .tab[data-tab]"));
+    const order = layout.tabs.order || [];
+    const hidden = new Set(layout.tabs.hidden || []);
+    const ranked = tabs.map((t, i) => {
+      const idx = order.indexOf(t.dataset.tab);
+      return { t, rank: idx >= 0 ? idx : 1000 + i };
+    }).sort((a, b) => a.rank - b.rank);
+    ranked.forEach(({ t }) => bar.appendChild(t));
+    tabs.forEach((t) => {
+      const name = t.dataset.tab;
+      const hide = hidden.has(name) && !UNHIDEABLE_TABS.has(name) && name !== this._currentTab;
+      t.classList.toggle("jl-hidden", hide && !this._layoutEditing);
+      t.classList.toggle("jl-dim", hidden.has(name) && !!this._layoutEditing);
+    });
+
+    let btn = bar.querySelector(":scope > .jl-edit-btn");
+    if (!btn) {
+      btn = document.createElement("button");
+      btn.className = "jl-edit-btn";
+      btn.type = "button";
+      btn.title = "Rearrange this panel";
+      btn.addEventListener("click", () => {
+        this._layoutEditing = !this._layoutEditing;
+        this._render();
+      });
+    }
+    btn.textContent = this._layoutEditing ? "✓ DONE" : "⇅ LAYOUT";
+    btn.classList.toggle("on", !!this._layoutEditing);
+    bar.appendChild(btn);
+  };
+
+  // ── edit chrome ────────────────────────────────────────────────────────────
+  P._jlAddTools = function (el, gk, isHidden) {
+    let tools = el.querySelector(":scope > .jl-tools");
+    if (tools) tools.remove();
+    tools = document.createElement("div");
+    tools.className = "jl-tools";
+    // A block that holds other movable boxes (the Command Center top row) gets
+    // its toolbar centred and labelled, so it doesn't sit on a child's toolbar.
+    const isGroup = !el.classList.contains("panel") && !!el.querySelector(".panel");
+    if (isGroup) tools.classList.add("jl-tools-group");
+    tools.innerHTML =
+      (isGroup ? `<span class="jl-group-label">ROW</span>` : "") +
+      `<span class="jl-handle" draggable="true" title="Drag to move">⠿</span>` +
+      `<button type="button" data-jl="up" title="Move up / left">▲</button>` +
+      `<button type="button" data-jl="down" title="Move down / right">▼</button>` +
+      `<button type="button" data-jl="eye" title="${isHidden ? "Show" : "Hide"}">${isHidden ? "SHOW" : "HIDE"}</button>`;
+    el.insertBefore(tools, el.firstChild);
+
+    tools.addEventListener("click", (e) => {
+      const b = e.target.closest("button[data-jl]");
+      if (!b) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const act = b.dataset.jl;
+      if (act === "eye") return this._jlToggleHidden(el, gk);
+      const sibs = this._jlSiblings(el, gk);
+      const i = sibs.indexOf(el);
+      const j = act === "up" ? i - 1 : i + 1;
+      if (j < 0 || j >= sibs.length) return;
+      const other = sibs[j];
+      if (act === "up") other.parentNode.insertBefore(el, other);
+      else other.parentNode.insertBefore(el, other.nextSibling);
+      this._jlCommitGroup(el, gk);
+    });
+
+    const handle = tools.querySelector(".jl-handle");
+    handle.addEventListener("dragstart", (e) => {
+      this._jlDragging = true;
+      this._jlDragEl = el;
+      el.classList.add("jl-dragging");
+      try {
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", el.dataset.jlKey || "");
+        e.dataTransfer.setDragImage(el, 20, 20);
+      } catch (_) { /* older browsers */ }
+    });
+    handle.addEventListener("dragend", () => this._jlEndDrag(gk));
+
+    if (!el._jlDropWired) {
+      el._jlDropWired = true;
+      el.addEventListener("dragover", (e) => {
+        const drag = this._jlDragEl;
+        if (!drag || drag === el || el._jlGroup !== drag._jlGroup) return;
+        e.preventDefault();
+        const r = el.getBoundingClientRect();
+        const d = drag.getBoundingClientRect();
+        const sameRow = Math.abs(r.top - d.top) < 12;
+        const before = sameRow ? e.clientX < r.left + r.width / 2 : e.clientY < r.top + r.height / 2;
+        const ref = before ? el : el.nextSibling;
+        if (ref !== drag && drag.nextSibling !== ref) el.parentNode.insertBefore(drag, ref);
+      });
+      el.addEventListener("drop", (e) => { if (this._jlDragEl) e.preventDefault(); });
+    }
+  };
+
+  P._jlEndDrag = function (gk) {
+    const el = this._jlDragEl;
+    this._jlDragEl = null;
+    if (el) {
+      el.classList.remove("jl-dragging");
+      this._jlCommitGroup(el, gk);
+    }
+    this._jlDragging = false;
+    if (this._pendingRender) this._render();
+  };
+
+  P._jlSiblings = function (el, gk) {
+    return Array.from(el.parentNode.children).filter((c) => c._jlGroup === gk);
+  };
+
+  P._jlCommitGroup = function (el, gk) {
+    const layout = this._jlLoad();
+    const sibs = this._jlSiblings(el, gk);
+    const prev = layout.sections[gk] || { order: [], hidden: [] };
+    layout.sections[gk] = { order: sibs.map((s) => s.dataset.jlKey), hidden: prev.hidden || [] };
+    if (el.parentNode) this._jlGridTracks(el.parentNode);
+    this._jlSave();
+  };
+
+  P._jlToggleHidden = function (el, gk) {
+    const layout = this._jlLoad();
+    const sibs = this._jlSiblings(el, gk);
+    const cur = layout.sections[gk] || { order: sibs.map((s) => s.dataset.jlKey), hidden: [] };
+    const hidden = new Set(cur.hidden || []);
+    const key = el.dataset.jlKey;
+    if (hidden.has(key)) hidden.delete(key); else hidden.add(key);
+    layout.sections[gk] = { order: cur.order.length ? cur.order : sibs.map((s) => s.dataset.jlKey), hidden: [...hidden] };
+    this._jlSave();
+    this._jlApply();
+  };
+
+  P._jlAddBar = function (app) {
+    const old = app.querySelector(":scope > .jl-bar");
+    if (old) old.remove();
+    const tabBar = app.querySelector(":scope > .tab-bar");
+    if (!tabBar) return;
+    const layout = this._jlLoad();
+    const hidden = new Set(layout.tabs.hidden || []);
+    const tabs = Array.from(tabBar.querySelectorAll(":scope > .tab[data-tab]"));
+    const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    const chips = tabs.map((t) => {
+      const name = t.dataset.tab;
+      const locked = UNHIDEABLE_TABS.has(name);
+      return `<span class="jl-chip ${hidden.has(name) ? "jl-chip-off" : ""}" data-tab="${esc(name)}">` +
+        `<button type="button" data-jl="tab-left" title="Move tab left">◀</button>` +
+        `<span class="jl-chip-name">${esc(t.textContent.trim())}</span>` +
+        `<button type="button" data-jl="tab-right" title="Move tab right">▶</button>` +
+        (locked ? "" : `<button type="button" data-jl="tab-eye" title="${hidden.has(name) ? "Show tab" : "Hide tab"}">${hidden.has(name) ? "SHOW" : "HIDE"}</button>`) +
+        `</span>`;
+    }).join("");
+
+    const bar = document.createElement("div");
+    bar.className = "jl-bar panel";
+    bar.innerHTML =
+      `<div class="jl-bar-row"><span class="jl-bar-title">LAYOUT EDIT</span>` +
+      `<span class="jl-bar-hint">Drag ⠿ or use ▲▼ to move a section within its group · HIDE removes it from view · changes save automatically</span>` +
+      `<span class="jl-bar-actions"><button type="button" data-jl="reset-tab">RESET THIS TAB</button>` +
+      `<button type="button" data-jl="reset-all">RESET ALL</button>` +
+      `<button type="button" data-jl="done" class="jl-done">✓ DONE</button></span></div>` +
+      `<div class="jl-bar-row jl-tabs"><span class="jl-bar-label">TABS</span>${chips}</div>`;
+    tabBar.parentNode.insertBefore(bar, tabBar.nextSibling);
+
+    bar.addEventListener("click", (e) => {
+      const b = e.target.closest("button[data-jl]");
+      if (!b) return;
+      const act = b.dataset.jl;
+      const lay = this._jlLoad();
+      if (act === "done") { this._layoutEditing = false; this._render(); return; }
+      if (act === "reset-tab") {
+        const tab = this._currentTab || "dashboard";
+        Object.keys(lay.sections).forEach((k) => { if (k.startsWith(`${tab}|`)) delete lay.sections[k]; });
+        this._jlSave(); this._render(); return;
+      }
+      if (act === "reset-all") {
+        if (!confirm("Reset the whole panel to its original layout?")) return;
+        this._layout = emptyLayout();
+        this._jlSave(); this._render(); return;
+      }
+      const chip = b.closest(".jl-chip");
+      const name = chip && chip.dataset.tab;
+      if (!name) return;
+      const names = Array.from(tabBar.querySelectorAll(":scope > .tab[data-tab]")).map((t) => t.dataset.tab);
+      if (act === "tab-left" || act === "tab-right") {
+        const i = names.indexOf(name);
+        const j = act === "tab-left" ? i - 1 : i + 1;
+        if (j < 0 || j >= names.length) return;
+        [names[i], names[j]] = [names[j], names[i]];
+        lay.tabs.order = names;
+      } else if (act === "tab-eye") {
+        const h = new Set(lay.tabs.hidden || []);
+        if (h.has(name)) h.delete(name); else h.add(name);
+        lay.tabs.hidden = [...h];
+      }
+      this._jlSave();
+      this._render();
+    });
+  };
+
+  // Tabs that fill in after the first paint (Intrusion, Memory, …) add their
+  // sections later — lay those out too.
+  P._jlWatch = function (app) {
+    if (this._jlObserver) this._jlObserver.disconnect();
+    if (typeof MutationObserver === "undefined") return;
+    this._jlObserver = new MutationObserver((muts) => {
+      if (this._jlApplying || this._jlDragging) return;
+      const added = muts.some((m) => Array.from(m.addedNodes).some((n) =>
+        n instanceof HTMLElement && !n.dataset?.jlKey && !n.classList.contains("jl-tools") &&
+        !n.classList.contains("jl-bar") && (n.classList.contains("panel") || n.querySelector?.(".panel"))));
+      if (!added) return;
+      clearTimeout(this._jlWatchTimer);
+      this._jlWatchTimer = setTimeout(() => {
+        if (this._jlApplying || this._jlDragging) return;
+        this._jlObserver.disconnect();
+        try { this._jlApply(); } catch (err) { console.warn("JARVIS layout: re-apply failed", err); }
+      }, 150);
+    });
+    this._jlObserver.observe(app, { childList: true, subtree: true });
+  };
+
+  P._jlEnsureStyles = function () {
+    if (this.shadowRoot.querySelector("#jl-style")) return;
+    const st = document.createElement("style");
+    st.id = "jl-style";
+    st.textContent = `
+      .jl-hidden { display: none !important; }
+      .tab-bar { align-items: center; }
+      .jl-edit-btn {
+        margin-left: auto; flex: 0 0 auto;
+        font-family: var(--font-mono, monospace); font-size: 10px; letter-spacing: 0.18em;
+        color: var(--cyan-dim, #1fb6c9); background: transparent;
+        border: 1px solid var(--line, rgba(0,242,254,0.12)); border-radius: var(--radius, 8px);
+        padding: 6px 10px; cursor: pointer; transition: border-color .2s, color .2s, box-shadow .2s;
+      }
+      .jl-edit-btn:hover, .jl-edit-btn.on {
+        color: var(--cyan, #00f2fe); border-color: var(--line-hot, rgba(0,242,254,0.35));
+        box-shadow: 0 0 12px rgba(0, 242, 254, 0.15);
+      }
+      .jl-bar { margin: 12px 0; padding: 12px 16px; border-color: var(--line-hot, rgba(0,242,254,0.35)); }
+      .jl-bar-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+      .jl-bar-row + .jl-bar-row { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.05); }
+      .jl-bar-title, .jl-bar-label {
+        font-family: var(--font-display, sans-serif); font-weight: 700; font-size: 11px;
+        letter-spacing: 0.25em; color: var(--cyan, #00f2fe);
+      }
+      .jl-bar-label { color: var(--text-dim, #64748b); }
+      .jl-bar-hint { font-size: 11px; color: var(--text-dim, #64748b); flex: 1 1 260px; }
+      .jl-bar-actions { display: flex; gap: 8px; margin-left: auto; }
+      .jl-bar button, .jl-tools button {
+        font-family: var(--font-mono, monospace); font-size: 10px; letter-spacing: 0.12em;
+        color: var(--text, #e2e8f0); background: rgba(14, 24, 44, 0.85);
+        border: 1px solid var(--line, rgba(0,242,254,0.12)); border-radius: 6px;
+        padding: 4px 8px; cursor: pointer;
+      }
+      .jl-bar button:hover, .jl-tools button:hover { border-color: var(--line-hot, rgba(0,242,254,0.35)); color: var(--cyan, #00f2fe); }
+      .jl-bar .jl-done { color: var(--cyan, #00f2fe); border-color: var(--line-hot, rgba(0,242,254,0.35)); }
+      .jl-chip {
+        display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px;
+        border: 1px solid var(--line, rgba(0,242,254,0.12)); border-radius: 8px;
+      }
+      .jl-chip-name { font-size: 11px; padding: 0 4px; color: var(--text, #e2e8f0); }
+      .jl-chip-off { opacity: 0.45; }
+      .jl-editing .jl-sec { position: relative; outline: 1px dashed var(--line-hot, rgba(0,242,254,0.35)); outline-offset: 3px; }
+      .jl-tools {
+        position: absolute; top: -12px; right: 14px; z-index: 30;
+        display: flex; gap: 4px; align-items: center;
+        background: rgba(6, 10, 19, 0.92); border: 1px solid var(--line-hot, rgba(0,242,254,0.35));
+        border-radius: 8px; padding: 3px 5px; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+      }
+      .jl-tools-group { left: 50%; right: auto; transform: translateX(-50%); }
+      .jl-group-label {
+        font-family: var(--font-display, sans-serif); font-size: 9px; font-weight: 700;
+        letter-spacing: 0.25em; color: var(--text-dim, #64748b); padding: 0 4px;
+      }
+      .jl-handle { cursor: grab; color: var(--cyan, #00f2fe); font-size: 16px; line-height: 1; padding: 0 4px; user-select: none; }
+      .jl-handle:active { cursor: grabbing; }
+      .jl-editing .jl-dim { opacity: 0.35; filter: grayscale(0.6); }
+      .jl-dragging { opacity: 0.5; outline: 1px solid var(--cyan, #00f2fe) !important; }
+      @media (min-width: 901px) {
+        .grid.jl-cols { grid-template-columns: var(--jl-cols) !important; }
+      }
+      @media (max-width: 600px) {
+        .jl-bar-hint { display: none; }
+        .jl-tools { right: 6px; }
+      }
+    `;
+    this.shadowRoot.appendChild(st);
+  };
+})();
+
 // Register the custom element — must match webcomponent_name in panel registration
 if (!customElements.get("jarvis-panel")) {
   customElements.define("jarvis-panel", JarvisPanel);

@@ -999,6 +999,7 @@ async def ws_get_panel_data(
                 "floor_plan_sqft":      _runtime_opt(hass, entry, "floor_plan_sqft", ""),
                 "floor_plan_units":     str(_runtime_opt(hass, entry, "floor_plan_units", "imperial") or "imperial"),
                 "floor_plan_elements":  _get_runtime_json(hass, entry, "floor_plan_elements", {}),
+                "panel_layout":         _get_runtime_json(hass, entry, "panel_layout", {}),
                 "floor_plan_cameras":   _get_runtime_json(hass, entry, "floor_plan_cameras", {}),
                 "floor_plan_entities":  _get_runtime_json(hass, entry, "floor_plan_entities", {}),
                 "floor_plan_bg_opacity": _runtime_opt(hass, entry, "floor_plan_bg_opacity", ""),
@@ -1526,6 +1527,7 @@ PANEL_WRITABLE_KEYS = {
     "floor_plan_sqft",           # str/int: estimated square footage
     "floor_plan_units",          # "imperial" | "metric" for room dimensions
     "floor_plan_elements",       # JSON: placed windows/doors per floor (+ sensor map)
+    "panel_layout",              # JSON: panel layout editor (section order/hidden, tab order/hidden)
     "floor_plan_cameras",        # JSON: placed cameras per floor (pos/angle/fov/range) (v7.17.0)
     "floor_plan_property",       # JSON: property boundary polygon {points:[[x,y],...]} (v7.22.0)
     "home_context_max_entities", # int: entity names per domain in the system prompt (0=counts only) (v7.23.1)
