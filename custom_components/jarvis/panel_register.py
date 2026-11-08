@@ -89,7 +89,9 @@ async def _register_one(
             sidebar_icon=icon,
             module_url=module_url,
             embed_iframe=False,
-            require_admin=False,
+            # ADMIN-1 (dthomas946 fork): JARVIS panel is an admin tool; household
+            # members use the Home dashboard and voice.
+            require_admin=True,
         )
         _LOGGER.info("JARVIS panel registered: /%s", url_path)
         return True

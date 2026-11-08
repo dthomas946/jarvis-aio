@@ -701,7 +701,27 @@ class OllamaProvider(OpenAIProvider):
                 num_ctx = OLLAMA_NUM_CTX
         except Exception:
             num_ctx = OLLAMA_NUM_CTX
-        return {"keep_alive": OLLAMA_KEEP_ALIVE, "think": bool(thinking),
+        # AI-1 (dthomas946 fork): keep-loaded time is a setting
+        # (ollama_keep_alive). A number is seconds; negative = keep loaded
+        # forever. A string is passed through as an Ollama duration ("30m").
+        keep_alive = OLLAMA_KEEP_ALIVE
+        try:
+            from . import jarvis_config
+            _ka = jarvis_config.get("ollama_keep_alive", None)
+            if isinstance(_ka, bool):
+                _ka = None
+            if isinstance(_ka, (int, float)):
+                keep_alive = -1 if _ka < 0 else int(_ka)
+            elif isinstance(_ka, str) and _ka.strip():
+                _t = _ka.strip()
+                try:
+                    _n = float(_t)
+                    keep_alive = -1 if _n < 0 else int(_n)
+                except ValueError:
+                    keep_alive = _t
+        except Exception:
+            keep_alive = OLLAMA_KEEP_ALIVE
+        return {"keep_alive": keep_alive, "think": bool(thinking),
                 "options": {"num_ctx": num_ctx}}
 
     def supports_thinking(self) -> bool:

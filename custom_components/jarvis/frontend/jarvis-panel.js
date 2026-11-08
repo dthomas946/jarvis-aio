@@ -1532,7 +1532,7 @@ class JarvisPanel extends HTMLElement {
       // Also fetch activity log from DB
       try {
         const logResult = await this._hass.callWS({
-          type: "jarvis/get_activity_log", hours: 2, limit: 30
+          type: "jarvis/get_activity_log", hours: 24, limit: 200
         });
         this._activityData = logResult?.entries || [];
       } catch (_) { /* no entries yet — fine */ }
@@ -14201,6 +14201,543 @@ ${this._renderExcludedEntities(d)}
       }
     `;
     this.shadowRoot.appendChild(st);
+  };
+})();
+
+// ═══ RELEASE 1 (dthomas946 fork) ═════════════════════════════════════════════
+// CC-1..5  System Status rows and info lines link to where they're controlled.
+// CAM-1    Honest camera label: LAST MOTION + capture time for stored captures.
+// CAM-2    ▶ LIVE: real live stream on demand; stops after 60 s, on tab change,
+//          when the panel closes or the page is hidden.
+// ACT-1/2  Activity Feed shows friendly names and only pertinent rows (ALL
+//          toggle shows everything).
+// AREA-2   Room drill-in lists every device in the room, grouped, with status.
+(() => {
+  const P = (typeof JarvisPanel !== "undefined") ? JarvisPanel.prototype : null;
+  if (!P || P._r1Installed) return;
+  P._r1Installed = true;
+
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  // ── CC: where each System Status row leads ──────────────────────────────────
+  const STATUS_KEYS = ["observer", "sleep", "llm_providers", "broadcast", "notify", "satellites"];
+  const STATUS_NAV = {
+    observer:      { section: "learning", card: "Observer Tuning",        log: "observer" },
+    sleep:         { section: "learning", card: "Quiet Hours",            log: "sleep" },
+    llm_providers: { section: "voice",    card: "AI Models",              log: "llm" },
+    broadcast:     { section: "voice",    card: "Announcement Speakers",  log: "broadcast" },
+    notify:        { section: "safety",   card: "Notifications",          log: "notify" },
+    satellites:    { section: "voice",    card: "Satellite → Speaker",    log: "satellite" },
+  };
+  const ERROR_LEVELS = /\b(err|error|crit|critical|fail|failed|down)\b/;
+
+  P._r1GoSettingsCard = function (section, card) {
+    this._navigateTo("settings", section);
+    let tries = 0;
+    const find = () => {
+      const root = this.shadowRoot;
+      if (!root) return;
+      const cards = root.querySelectorAll(".settings-page .panel, .settings-grid > .panel, .settings-extra-panel");
+      let hit = null;
+      cards.forEach(p => {
+        if (hit) return;
+        const h = p.querySelector(".head span");
+        const t = h ? h.textContent.trim().toLowerCase() : "";
+        if (t && (t === card.toLowerCase() || t.startsWith(card.toLowerCase()))) hit = p;
+      });
+      if (!hit) { if (++tries < 10) setTimeout(find, 80); return; }
+      try { hit.scrollIntoView({ block: "center", behavior: "smooth" }); } catch (_) { hit.scrollIntoView(); }
+      hit.classList.remove("r1-flash"); void hit.offsetWidth; hit.classList.add("r1-flash");
+      setTimeout(() => hit.classList.remove("r1-flash"), 2200);
+    };
+    setTimeout(find, 60);
+  };
+
+  P._r1GoLogs = function (search, filter) {
+    this._logSearch = search || "";
+    this._logFilter = filter || "all";
+    this._navigateTo("logs");
+  };
+
+  P._r1DecorateStatus = function () {
+    const root = this.shadowRoot;
+    const panel = root && root.querySelector(".c-status");
+    if (!panel) return;
+    panel.querySelectorAll(".status-row").forEach((row, i) => {
+      const key = STATUS_KEYS[i];
+      const nav = key && STATUS_NAV[key];
+      if (!nav) return;
+      row.setAttribute("data-r1-nav", key);
+      row.setAttribute("role", "button");
+      row.setAttribute("tabindex", "0");
+      if (row._r1Wired) return;
+      row._r1Wired = true;
+      const go = () => {
+        const v = (row.querySelector(".v")?.textContent || "").toLowerCase();
+        const lvl = row.className.toLowerCase();
+        if (ERROR_LEVELS.test(lvl) || ERROR_LEVELS.test(v)) this._r1GoLogs(nav.log, "all");
+        else this._r1GoSettingsCard(nav.section, nav.card);
+      };
+      row.addEventListener("click", go);
+      row.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+    });
+    // CC-4: info lines. Wrap "label + value" in a link so the existing patcher
+    // (which rewrites the 4 <span> values in order) keeps working.
+    const meta = panel.querySelector(".meta");
+    if (meta && !meta._r1Wired) {
+      meta._r1Wired = true;
+      const LINKS = [
+        { re: /areas\s+monitored/i, go: () => this._navigateTo("residence") },
+        { re: /announcements\s+today/i, go: () => this._r1GoLogs("", "GATE") },
+      ];
+      Array.from(meta.childNodes).forEach(node => {
+        if (node.nodeType !== 3) return;
+        const link = LINKS.find(l => l.re.test(node.textContent || ""));
+        if (!link) return;
+        const span = node.nextSibling && node.nextSibling.nodeName === "SPAN" ? node.nextSibling : null;
+        const a = document.createElement("a");
+        a.className = "r1-meta-link";
+        a.setAttribute("role", "button");
+        a.setAttribute("tabindex", "0");
+        meta.insertBefore(a, node);
+        a.appendChild(node);
+        if (span) a.appendChild(span);
+        a.addEventListener("click", link.go);
+        a.addEventListener("keydown", (e) => { if (e.key === "Enter") link.go(); });
+      });
+    }
+  };
+
+  // ── ACT: friendly names + pertinent-only feed ───────────────────────────────
+  const NOISE = /—\s*(not worth considering|flagged for reasoning)\s*$/i;
+  P._r1Pertinent = function (e) {
+    if (!e) return false;
+    const urg = String(e.urgency || "").toLowerCase();
+    if (urg === "high" || urg === "critical") return true;
+    if (e.was_spoken) return true;
+    if (NOISE.test(String(e.msg || ""))) return false;
+    return true;
+  };
+  const ACT_CAP = 40;
+  P._activityFiltered = function () {
+    const all = (this._activityData && this._activityData.length > 0) ? this._activityData : [];
+    const base = this._r1ActAll ? all : all.filter(e => this._r1Pertinent(e));
+    const empty = [{ ts: "--:--", urgency: "low", tag: "SYSTEM",
+      msg: this._r1ActAll ? "No activity yet." : "Nothing needs your attention. Tap ALL to see every event." }];
+    const entries = base.length ? base.slice(0, ACT_CAP) : empty;
+    const q = (this._activitySearch || "").trim().toLowerCase();
+    if (!q) return { rows: entries, total: base.length ? entries.length : 0 };
+    return {
+      rows: entries.filter(e =>
+        (e.msg || "").toLowerCase().includes(q) ||
+        (e.tag || "").toLowerCase().includes(q) ||
+        (e.name || "").toLowerCase().includes(q)),
+      total: entries.length,
+    };
+  };
+  P._evtRowHtml = function (e) {
+    const title = e.name || e.tag || "";
+    return `
+      <div class="evt ${this._esc(e.urgency || '')}">
+        <div class="ts">${this._esc(e.ts || '')}</div>
+        ${this._evtIcon(e.tag)}
+        <div class="msg"><b>${this._esc(title)}</b> · ${this._esc(e.msg || '')}</div>
+      </div>`;
+  };
+  P._r1DecorateActivity = function () {
+    const root = this.shadowRoot;
+    const head = root && root.querySelector(".c-log .head");
+    if (!head || head.querySelector(".r1-act-all")) return;
+    const btn = document.createElement("button");
+    btn.className = "r1-act-all" + (this._r1ActAll ? " on" : "");
+    btn.textContent = "ALL";
+    btn.title = "Show every event, including routine ones JARVIS ignored";
+    btn.addEventListener("click", () => {
+      this._r1ActAll = !this._r1ActAll;
+      btn.classList.toggle("on", !!this._r1ActAll);
+      this._updateActivityFeed();
+    });
+    const side = head.querySelector(".side");
+    head.insertBefore(btn, side || null);
+    this._updateActivityFeed();
+  };
+
+  // ── CAM-1 / CAM-2 ────────────────────────────────────────────────────────────
+  const LIVE_SECS = 60, LIVE_START_TIMEOUT = 25, LIVE_HARD_CAP = 120;
+
+  P._r1CaptureInfo = function (entity) {
+    const st = this._hass && this._hass.states ? this._hass.states[entity] : null;
+    if (!st) return null;
+    const src = st.attributes && st.attributes.image_source;
+    if (!src) return null;               // a real streaming camera — leave it alone
+    const s = String(src);
+    const slash = s.indexOf("/");
+    const kind = slash > 0 ? s.slice(0, slash).toLowerCase() : "capture";
+    const when = slash > 0 ? s.slice(slash + 1) : s;
+    const label = kind === "snapshot" ? "SNAPSHOT" : "LAST MOTION";
+    return { label, when };
+  };
+
+  P._r1PaintCamLabels = function () {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const entity = this._activeCam;
+    const stateEl = root.getElementById("cam-state");
+    const stripEl = root.getElementById("cam-strip");
+    if (!entity || !stripEl) return;
+    const live = this._r1Live && this._r1Live.entity === entity ? this._r1Live : null;
+    const focus = this._camFocus && this._camFocus.entity === entity;
+    const name = this._camName ? this._camName(entity) : entity;
+    if (live) {
+      const left = live.playingAt ? Math.max(0, LIVE_SECS - Math.floor((Date.now() - live.playingAt) / 1000)) : null;
+      if (stateEl) {
+        stateEl.textContent = live.playingAt ? `◉ LIVE ${left}s` : "◌ CONNECTING…";
+        stateEl.style.color = live.playingAt ? "var(--green)" : "var(--amber)";
+      }
+      stripEl.innerHTML = `<span>SRC <b>${esc(name)}</b></span>`
+        + `<span>${live.playingAt ? "LIVE STREAM" : "STARTING LIVE VIEW"}</span>`
+        + `<button class="r1-live-btn stop" type="button">■ STOP</button>`;
+    } else {
+      const info = this._r1CaptureInfo(entity);
+      if (!info) return;                 // non-Arlo camera: original labels stand
+      if (stateEl && !focus) {
+        stateEl.textContent = `◉ ${info.label}`;
+        stateEl.style.color = "var(--amber)";
+      }
+      stripEl.innerHTML = `<span>SRC <b>${esc(name)}</b></span>`
+        + `<span>${info.label} <b>${esc(info.when)}</b></span>`
+        + `<button class="r1-live-btn" type="button" title="Start a live view (stops after ${LIVE_SECS} seconds)">▶ LIVE</button>`;
+    }
+    const btn = stripEl.querySelector(".r1-live-btn");
+    if (btn) btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (this._r1Live) this._r1StopLive("stopped");
+      else this._r1StartLive(entity);
+    });
+  };
+
+  const findVideo = (node, depth = 0) => {
+    if (!node || depth > 12) return null;
+    if (node.tagName === "VIDEO") return node;
+    const kids = [];
+    if (node.shadowRoot) kids.push(...node.shadowRoot.children);
+    if (node.children) kids.push(...node.children);
+    for (const k of kids) { const v = findVideo(k, depth + 1); if (v) return v; }
+    return null;
+  };
+
+  P._r1StartLive = async function (entity) {
+    if (!entity || !this._hass) return;
+    this._r1StopLive();
+    const live = { entity, startedAt: Date.now(), playingAt: 0, wrap: null, card: null, timer: null };
+    this._r1Live = live;
+    const wrap = document.createElement("div");
+    wrap.className = "r1-live";
+    live.wrap = wrap;
+    this._r1AttachLive();
+    this._r1PaintCamLabels();
+    try {
+      if (typeof window.loadCardHelpers !== "function") throw new Error("live view needs the Home Assistant frontend");
+      const helpers = await window.loadCardHelpers();
+      if (this._r1Live !== live) return;
+      const card = helpers.createCardElement({
+        type: "picture-entity", entity, camera_view: "live",
+        show_name: false, show_state: false, tap_action: { action: "none" },
+      });
+      card.hass = this._hass;
+      live.card = card;
+      wrap.appendChild(card);
+    } catch (err) {
+      this._r1StopLive();
+      this._toast && this._toast("✗ live view — " + (err && err.message || err), "err");
+      return;
+    }
+    live.timer = setInterval(() => {
+      if (this._r1Live !== live) { clearInterval(live.timer); return; }
+      const now = Date.now();
+      if (!live.playingAt) {
+        const v = findVideo(live.card);
+        if (v && v.readyState >= 2 && !v.paused) live.playingAt = now;
+        else if (now - live.startedAt > LIVE_START_TIMEOUT * 1000) {
+          this._r1StopLive();
+          this._toast && this._toast("Live view didn't start — the camera may be asleep or busy. Try again in a moment.", "err");
+          return;
+        }
+      }
+      if ((live.playingAt && now - live.playingAt >= LIVE_SECS * 1000) ||
+          now - live.startedAt >= LIVE_HARD_CAP * 1000) {
+        this._r1StopLive("timeout");
+        return;
+      }
+      this._r1PaintCamLabels();
+    }, 1000);
+  };
+
+  P._r1AttachLive = function () {
+    const live = this._r1Live;
+    const feed = this.shadowRoot && this.shadowRoot.getElementById("cam-feed");
+    if (!live || !feed || !live.wrap) return;
+    if (live.wrap.parentNode !== feed) feed.appendChild(live.wrap);
+  };
+
+  P._r1StopLive = function (why) {
+    const live = this._r1Live;
+    if (!live) return;
+    this._r1Live = null;
+    if (live.timer) clearInterval(live.timer);
+    try { if (live.wrap && live.wrap.parentNode) live.wrap.parentNode.removeChild(live.wrap); } catch (_) {}
+    live.card = null; live.wrap = null;
+    if (why === "timeout" && this._toast) this._toast("Live view ended after 60 seconds.", "ok");
+    this._r1PaintCamLabels();
+  };
+
+  // ── AREA-2: every device in the room ────────────────────────────────────────
+  const TOGGLE_DOMAINS = { light: 1, switch: 1, fan: 1, valve: 1, siren: 1, humidifier: 1 };
+
+  P._r1RenderDevices = function () {
+    const root = this.shadowRoot;
+    const box = root && root.getElementById("r1-devices");
+    if (!box) return;
+    const areaId = this._expandedArea;
+    const cache = this._r1DevCache || (this._r1DevCache = {});
+    const hit = cache[areaId];
+    if (!hit || Date.now() - hit.at > 10000) {
+      if (!hit) box.innerHTML = `<div class="r1-dev-empty">Loading devices…</div>`;
+      if (!this._r1DevLoading) {
+        this._r1DevLoading = true;
+        this._hass.callWS({ type: "jarvis/area_devices", area_id: areaId }).then(res => {
+          cache[areaId] = { at: Date.now(), devices: (res && res.devices) || [] };
+        }).catch(err => {
+          cache[areaId] = { at: Date.now(), devices: [], error: String(err && err.message || err) };
+        }).finally(() => {
+          this._r1DevLoading = false;
+          if (this._expandedArea === areaId) this._r1RenderDevices();
+        });
+      }
+      if (!hit) return;
+    }
+    if (hit.error) { box.innerHTML = `<div class="r1-dev-empty">Couldn't load devices — ${esc(hit.error)}</div>`; return; }
+    if (!hit.devices.length) { box.innerHTML = `<div class="r1-dev-empty">No devices assigned to this room in Home Assistant.</div>`; return; }
+    const groups = [];
+    hit.devices.forEach(d => {
+      let g = groups.find(x => x.name === d.group);
+      if (!g) { g = { name: d.group, items: [] }; groups.push(g); }
+      g.items.push(d);
+    });
+    const states = (this._hass && this._hass.states) || {};
+    const ctl = (c) => {
+      const st = states[c.entity_id];
+      const s = st ? st.state : c.state;
+      if (TOGGLE_DOMAINS[c.domain]) {
+        const on = s === "on" || s === "open";
+        return `<button class="r1-dev-tgl ${on ? "on" : ""}" data-eid="${esc(c.entity_id)}" data-dom="${esc(c.domain)}" data-on="${on ? 1 : 0}">${on ? "ON" : "OFF"}</button>`;
+      }
+      if (c.domain === "lock") {
+        const locked = s === "locked";
+        return `<button class="r1-dev-act" data-eid="${esc(c.entity_id)}" data-svc="lock.${locked ? "unlock" : "lock"}" ${locked ? 'data-confirm="Unlock ' + esc(c.name) + '?"' : ""}>${locked ? "UNLOCK" : "LOCK"}</button>`;
+      }
+      if (c.domain === "cover") {
+        const closed = s === "closed";
+        return `<button class="r1-dev-act" data-eid="${esc(c.entity_id)}" data-svc="cover.${closed ? "open_cover" : "close_cover"}">${closed ? "OPEN" : "CLOSE"}</button>`;
+      }
+      return `<button class="r1-dev-more" data-eid="${esc(c.entity_id)}" title="More controls">›</button>`;
+    };
+    const statusOf = (c) => {
+      const st = states[c.entity_id];
+      if (!st) return c.status || c.state;
+      if (c.domain === "climate") {
+        const cur = st.attributes.current_temperature;
+        return cur != null ? `${cur}° · ${st.attributes.hvac_action || st.state}` : st.state;
+      }
+      if (c.domain === "sensor") return `${st.state} ${st.attributes.unit_of_measurement || ""}`.trim();
+      return String(st.state).replace(/_/g, " ");
+    };
+    box.innerHTML = groups.map(g => `
+      <div class="r1-dev-group">
+        <div class="r1-dev-gname">${esc(g.name)} <span>${g.items.length}</span></div>
+        ${g.items.map(d => {
+          const p = d.primary;
+          const multi = (d.controls || []).length > 1;
+          const statusLine = (d.status && d.status.entity_id !== p.entity_id && !TOGGLE_DOMAINS[p.domain])
+            ? statusOf(d.status) : statusOf(p);
+          return `<div class="r1-dev" data-dev="${esc(d.id)}">
+            <button class="r1-dev-name" data-eid="${esc(p.entity_id)}" title="Open ${esc(d.name)}">
+              <span class="r1-dev-n">${esc(d.name)}</span>
+              <span class="r1-dev-s">${esc(statusLine)}${multi ? ` · ${d.controls.length} controls` : ""}</span>
+            </button>
+            ${multi ? `<button class="r1-dev-more" data-expand="${esc(d.id)}" title="Show all controls">${this._r1DevOpen === d.id ? "▾" : "▸"}</button>` : ctl(p)}
+          </div>
+          ${multi && this._r1DevOpen === d.id ? `<div class="r1-dev-sub">${d.controls.map(c => `
+            <div class="r1-dev sub"><button class="r1-dev-name" data-eid="${esc(c.entity_id)}"><span class="r1-dev-n">${esc(c.name)}</span><span class="r1-dev-s">${esc(statusOf(c))}</span></button>${ctl(c)}</div>`).join("")}</div>` : ""}`;
+        }).join("")}
+      </div>`).join("");
+    box.querySelectorAll(".r1-dev-name").forEach(b => b.addEventListener("click", () => {
+      this.dispatchEvent(new CustomEvent("hass-more-info", {
+        detail: { entityId: b.getAttribute("data-eid") }, bubbles: true, composed: true }));
+    }));
+    box.querySelectorAll(".r1-dev-more[data-eid]").forEach(b => b.addEventListener("click", () => {
+      this.dispatchEvent(new CustomEvent("hass-more-info", {
+        detail: { entityId: b.getAttribute("data-eid") }, bubbles: true, composed: true }));
+    }));
+    box.querySelectorAll(".r1-dev-more[data-expand]").forEach(b => b.addEventListener("click", () => {
+      const id = b.getAttribute("data-expand");
+      this._r1DevOpen = this._r1DevOpen === id ? null : id;
+      this._r1RenderDevices();
+    }));
+    const after = () => setTimeout(() => {
+      if (this._r1DevCache) delete this._r1DevCache[areaId];
+      if (this._expandedArea === areaId) this._r1RenderDevices();
+    }, 700);
+    box.querySelectorAll(".r1-dev-tgl").forEach(b => b.addEventListener("click", async () => {
+      const eid = b.getAttribute("data-eid"), dom = b.getAttribute("data-dom");
+      const on = b.getAttribute("data-on") === "1";
+      const svcDom = dom === "valve" ? "valve" : dom;
+      const svc = dom === "valve" ? (on ? "close_valve" : "open_valve") : (on ? "turn_off" : "turn_on");
+      try { await this._hass.callService(svcDom, svc, { entity_id: eid }); after(); }
+      catch (err) { this._toast && this._toast("✗ " + (err && err.message || err), "err"); }
+    }));
+    box.querySelectorAll(".r1-dev-act").forEach(b => b.addEventListener("click", async () => {
+      const conf = b.getAttribute("data-confirm");
+      if (conf && !window.confirm(conf)) return;
+      const [d, s] = b.getAttribute("data-svc").split(".");
+      try { await this._hass.callService(d, s, { entity_id: b.getAttribute("data-eid") }); after(); }
+      catch (err) { this._toast && this._toast("✗ " + (err && err.message || err), "err"); }
+    }));
+  };
+
+  const origDetail = P._renderAreaDetail;
+  P._renderAreaDetail = function (d) {
+    const html = origDetail.call(this, d);
+    if (!html) return html;
+    const i = html.lastIndexOf("</div>", html.lastIndexOf("</div>") - 1);
+    if (i < 0) return html;
+    return html.slice(0, i) + `<div class="r1-devices" id="r1-devices"></div>\n        ` + html.slice(i);
+  };
+
+  // ── hooks ────────────────────────────────────────────────────────────────────
+  const origRender = P._render;
+  P._render = function () {
+    if (this._r1Live && this._currentTab !== "dashboard") this._r1StopLive();
+    const keepLive = this._r1Live && this._r1Live.wrap;
+    if (keepLive && keepLive.parentNode) keepLive.parentNode.removeChild(keepLive);
+    const r = origRender.apply(this, arguments);
+    try {
+      this._r1DecorateStatus();
+      this._r1DecorateActivity();
+      this._r1AttachLive();
+      this._r1PaintCamLabels();
+      if (this._expandedArea) this._r1RenderDevices();
+      else this._r1DevOpen = null;
+    } catch (err) { console.warn("JARVIS release-1 decorate failed", err); }
+    return r;
+  };
+
+  const origPatch = P._patchLiveDom;
+  if (origPatch) P._patchLiveDom = function () {
+    const r = origPatch.apply(this, arguments);
+    try { this._r1DecorateStatus(); this._r1PaintCamLabels(); } catch (_) {}
+    return r;
+  };
+
+  const origFeed = P._renderCameraFeed;
+  if (origFeed) P._renderCameraFeed = function () {
+    const r = origFeed.apply(this, arguments);
+    try { this._r1AttachLive(); this._r1PaintCamLabels(); } catch (_) {}
+    return r;
+  };
+
+
+  ["_camFallback", "_camJarvisFallback"].forEach(fn => {
+    const orig = P[fn];
+    if (orig) P[fn] = function () {
+      const r = orig.apply(this, arguments);
+      try { this._r1PaintCamLabels(); } catch (_) {}
+      return r;
+    };
+  });
+  const origSelect = P._selectCam;
+  if (origSelect) P._selectCam = function (entity) {
+    if (this._r1Live && this._r1Live.entity !== entity) this._r1StopLive();
+    return origSelect.apply(this, arguments);
+  };
+
+  const origDisc = P.disconnectedCallback;
+  P.disconnectedCallback = function () {
+    try { this._r1StopLive(); } catch (_) {}
+    return origDisc ? origDisc.apply(this, arguments) : undefined;
+  };
+
+  const desc = Object.getOwnPropertyDescriptor(P, "hass");
+  if (desc && desc.set) {
+    Object.defineProperty(P, "hass", {
+      configurable: true,
+      get: desc.get,
+      set(h) {
+        desc.set.call(this, h);
+        if (this._r1Live && this._r1Live.card) { try { this._r1Live.card.hass = h; } catch (_) {} }
+      },
+    });
+  }
+
+  P._r1VisHook = function () {
+    if (this._r1VisWired) return;
+    this._r1VisWired = true;
+    document.addEventListener("visibilitychange", () => { if (document.hidden) this._r1StopLive(); });
+  };
+  const origStart = P._startIntervals;
+  if (origStart) P._startIntervals = function () {
+    this._r1VisHook();
+    return origStart.apply(this, arguments);
+  };
+
+  // ── styles ───────────────────────────────────────────────────────────────────
+  const CSS = `
+  .c-status .status-row[data-r1-nav] { cursor: pointer; position: relative; padding-right: 26px; }
+  .c-status .status-row[data-r1-nav]::after { content: '›'; position: absolute; right: 10px; top: 50%;
+    transform: translateY(-52%); color: var(--text-faint); font-size: 16px; transition: color .2s, right .2s; }
+  .c-status .status-row[data-r1-nav]:hover { background: rgba(0,242,254,0.06); }
+  .c-status .status-row[data-r1-nav]:hover::after { color: var(--cyan); right: 7px; }
+  .r1-meta-link { cursor: pointer; color: inherit; text-decoration: none; border-bottom: 1px dotted transparent; }
+  .r1-meta-link::after { content: ' ›'; color: var(--text-faint); }
+  .r1-meta-link:hover { border-bottom-color: var(--cyan-dim); }
+  .r1-meta-link:hover::after { color: var(--cyan); }
+  .r1-flash { animation: r1flash 2s ease-out 1; }
+  @keyframes r1flash { 0%,30% { box-shadow: 0 0 0 2px var(--cyan), 0 0 28px rgba(0,242,254,0.45); }
+    100% { box-shadow: none; } }
+  .c-log .head .r1-act-all { margin-left: auto; margin-right: 10px; background: transparent;
+    border: 1px solid var(--line); color: var(--text-dim); font-family: var(--font-mono); font-size: 9px;
+    letter-spacing: 0.15em; padding: 2px 8px; border-radius: 4px; cursor: pointer; }
+  .c-log .head .r1-act-all.on { color: var(--cyan); border-color: var(--cyan-dim); background: rgba(0,242,254,0.08); }
+  .r1-live { position: absolute; inset: 0; z-index: 5; background: #000; display: flex; align-items: center; }
+  .r1-live > * { width: 100%; }
+  .cam-strip .r1-live-btn { background: rgba(0,242,254,0.08); border: 1px solid var(--cyan-dim); color: var(--cyan);
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.12em; padding: 1px 9px; border-radius: 4px; cursor: pointer; }
+  .cam-strip .r1-live-btn.stop { color: var(--red); border-color: rgba(255,77,109,0.5); background: rgba(255,77,109,0.08); }
+  .area-detail-card { max-height: calc(100vh - 40px); display: flex; flex-direction: column; }
+  .r1-devices { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; overflow-y: auto; min-height: 0; flex: 1 1 auto; max-height: 55vh; }
+  .r1-dev-empty { font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); padding: 6px 2px; }
+  .r1-dev-group + .r1-dev-group { margin-top: 10px; }
+  .r1-dev-gname { font-family: var(--font-display); font-size: 9px; letter-spacing: 0.22em; color: var(--cyan);
+    text-transform: uppercase; margin-bottom: 5px; }
+  .r1-dev-gname span { color: var(--text-faint); margin-left: 4px; }
+  .r1-dev { display: flex; align-items: center; gap: 8px; padding: 6px 8px; margin-bottom: 4px;
+    border: 1px solid var(--line); border-radius: 6px; background: var(--bg-elev); }
+  .r1-dev.sub { margin-left: 14px; }
+  .r1-dev-name { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+    background: transparent; border: 0; padding: 0; cursor: pointer; text-align: left; }
+  .r1-dev-n { color: var(--text); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .r1-dev-s { color: var(--text-dim); font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.05em; }
+  .r1-dev-tgl, .r1-dev-act, .r1-dev-more { flex-shrink: 0; background: transparent; border: 1px solid var(--line);
+    color: var(--text-dim); font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.1em;
+    padding: 3px 9px; border-radius: 4px; cursor: pointer; min-width: 44px; }
+  .r1-dev-tgl.on { color: var(--amber); border-color: rgba(255,180,84,0.6); background: rgba(255,180,84,0.08); }
+  .r1-dev-act { color: var(--cyan); border-color: var(--cyan-dim); }
+  .r1-dev-more { min-width: 30px; font-size: 13px; padding: 1px 8px; }
+  `;
+  const origStyles = P._styles;
+  P._styles = function () {
+    return origStyles.apply(this, arguments).replace(/<\/style>\s*$/, CSS + "</style>");
   };
 })();
 

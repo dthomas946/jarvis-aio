@@ -64,6 +64,7 @@ def async_register(hass: HomeAssistant) -> None:
         websocket_api.async_register_command(hass, ws_search_memory)
         websocket_api.async_register_command(hass, ws_get_briefings)
         websocket_api.async_register_command(hass, ws_area_lights)
+        websocket_api.async_register_command(hass, ws_area_devices)
         websocket_api.async_register_command(hass, ws_get_debug_log)
         websocket_api.async_register_command(hass, ws_get_cognitive_status)
         websocket_api.async_register_command(hass, ws_run_analysis)
@@ -1466,10 +1467,22 @@ async def ws_get_activity_log(
                 hhmm = local_dt.strftime("%H:%M")
             except Exception:
                 hhmm = ts_str[:5] if len(ts_str) >= 5 else ts_str
+            eid = e.get("entity_id", "") or ""
+            # ACT-1 (dthomas946 fork): friendly name for the row title, falling
+            # back to the entity id when HA has no name for it.
+            fname = ""
+            if eid:
+                _st = hass.states.get(eid)
+                if _st is not None:
+                    fname = str(_st.attributes.get("friendly_name") or "")
             result.append({
                 "ts": hhmm,
                 "urgency": e.get("urgency", "low"),
-                "tag": (e.get("entity_id", "").split(".", 1)[-1][:20] or e.get("source", "")).upper(),
+                "tag": (eid.split(".", 1)[-1][:20] or e.get("source", "")).upper(),
+                "name": fname,
+                "entity_id": eid,
+                "category": e.get("category", ""),
+                "was_spoken": bool(e.get("was_spoken", 0)),
                 "msg": e.get("message", ""),
                 "source": e.get("source", "observer"),
             })
@@ -1527,7 +1540,8 @@ PANEL_WRITABLE_KEYS = {
     "floor_plan_sqft",           # str/int: estimated square footage
     "floor_plan_units",          # "imperial" | "metric" for room dimensions
     "floor_plan_elements",       # JSON: placed windows/doors per floor (+ sensor map)
-    "panel_layout",              # JSON: panel layout editor (section order/hidden, tab order/hidden)
+    "panel_layout",
+    "ollama_keep_alive",         # AI-1: Ollama keep-loaded time (seconds; -1 = forever, or "30m")              # JSON: panel layout editor (section order/hidden, tab order/hidden)
     "floor_plan_cameras",        # JSON: placed cameras per floor (pos/angle/fov/range) (v7.17.0)
     "floor_plan_property",       # JSON: property boundary polygon {points:[[x,y],...]} (v7.22.0)
     "home_context_max_entities", # int: entity names per domain in the system prompt (0=counts only) (v7.23.1)
@@ -2745,6 +2759,155 @@ async def ws_area_lights(
     except Exception as exc:
         _LOGGER.warning("ws_area_lights failed: %s", exc)
         connection.send_error(msg["id"], "area_lights_failed", str(exc))
+
+
+# ─── AREA-2 (dthomas946 fork): every device in a room, grouped ───────────────
+# Domains a person can act on from the room drill-in, best-first (the first one
+# a device has becomes its "primary" row control).
+_AD_CONTROL_ORDER = ("light", "switch", "lock", "cover", "valve", "fan",
+                     "climate", "vacuum", "media_player", "humidifier",
+                     "water_heater", "siren", "alarm_control_panel")
+_AD_STATUS_ORDER = ("binary_sensor", "sensor", "device_tracker", "event")
+_AD_SKIP_DOMAINS = {"update", "button", "number", "select", "text", "image",
+                    "calendar", "tts", "stt", "conversation", "wake_word",
+                    "assist_satellite", "scene", "script", "automation",
+                    "camera", "time", "date", "datetime", "notify", "todo",
+                    "event"}
+_AD_GROUP_LABEL = {
+    "light": "Lights", "switch": "Switches", "lock": "Locks", "cover": "Covers",
+    "valve": "Irrigation", "irrigation": "Irrigation", "fan": "Fans",
+    "climate": "Climate", "vacuum": "Appliances", "media_player": "Media",
+    "humidifier": "Climate", "water_heater": "Appliances", "siren": "Security",
+    "alarm_control_panel": "Security", "appliance": "Appliances",
+    "sensor": "Sensors",
+}
+_AD_GROUP_ORDER = ["Lights", "Switches", "Irrigation", "Climate", "Locks",
+                   "Covers", "Fans", "Security", "Appliances", "Media", "Sensors"]
+_AD_STATUS_HINTS = ("power state", "any burner active", "running", "status",
+                    "operating state", "state", "mode", "door", "active")
+
+
+def _ad_status_text(st) -> str:
+    """Short human status for one entity state."""
+    if st is None:
+        return "—"
+    dom = st.entity_id.split(".", 1)[0]
+    s = str(st.state)
+    if s in ("unavailable", "unknown"):
+        return s
+    a = st.attributes
+    if dom == "climate":
+        cur = a.get("current_temperature")
+        act = a.get("hvac_action") or s
+        unit = a.get("temperature_unit") or ""
+        return f"{cur}{unit} · {act}" if cur is not None else str(act)
+    if dom in ("sensor",):
+        unit = a.get("unit_of_measurement") or ""
+        return f"{s} {unit}".strip()
+    if dom == "binary_sensor":
+        return "on" if s == "on" else "off"
+    return s.replace("_", " ")
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/area_devices",
+    vol.Required("area_id"): str,
+})
+@websocket_api.async_response
+async def ws_area_devices(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Every device in an area, one row each, with its main status and the
+    entities you can act on (AREA-2). Hidden, disabled and diagnostic/config
+    entities are left out, as are excluded entities (same filter the room
+    card uses). Read-only; actions are plain HA service calls from the panel."""
+    try:
+        from homeassistant.helpers import entity_registry as er, device_registry as dr
+        area_id = str(msg.get("area_id") or "")
+        ent_reg = er.async_get(hass)
+        dev_reg = dr.async_get(hass)
+        wanted = set(_entities_in_area(hass, area_id))
+        by_dev: dict = {}
+        for eid in wanted:
+            ent = ent_reg.async_get(eid)
+            if ent is None or ent.disabled_by or ent.hidden_by:
+                continue
+            if ent.entity_category is not None:
+                continue
+            dom = eid.split(".", 1)[0]
+            if dom in _AD_SKIP_DOMAINS:
+                continue
+            st = hass.states.get(eid)
+            if st is None:
+                continue
+            key = ent.device_id or f"entity:{eid}"
+            by_dev.setdefault(key, []).append((ent, st))
+
+        devices = []
+        for key, items in by_dev.items():
+            dev = dev_reg.async_get(key) if not key.startswith("entity:") else None
+            dname = ""
+            if dev is not None:
+                dname = dev.name_by_user or dev.name or ""
+            controls = []
+            statuses = []
+            for ent, st in items:
+                dom = st.entity_id.split(".", 1)[0]
+                name = str(st.attributes.get("friendly_name") or st.entity_id)
+                row = {"entity_id": st.entity_id, "domain": dom, "name": name,
+                       "state": st.state, "status": _ad_status_text(st),
+                       "platform": ent.platform}
+                if dom in _AD_CONTROL_ORDER:
+                    controls.append(row)
+                elif dom in _AD_STATUS_ORDER:
+                    statuses.append(row)
+            if not controls and not statuses:
+                continue
+            controls.sort(key=lambda r: (_AD_CONTROL_ORDER.index(r["domain"]), r["name"].lower()))
+
+            def _status_rank(r):
+                low = r["name"].lower()
+                for i, h in enumerate(_AD_STATUS_HINTS):
+                    if h in low:
+                        return (0 if r["domain"] == "binary_sensor" else 1, i)
+                bad = r["state"] in ("unknown", "unavailable")
+                return (2 + (1 if bad else 0), 99)
+            statuses.sort(key=_status_rank)
+            primary = controls[0] if controls else statuses[0]
+            pdom = primary["domain"]
+            if pdom in ("switch", "valve") and (
+                    primary["platform"] == "rachio" or "zone" in primary["entity_id"]
+                    or pdom == "valve"):
+                group = "Irrigation"
+            elif controls:
+                group = _AD_GROUP_LABEL.get(pdom, "Switches")
+            elif pdom == "sensor" and not dname:
+                group = "Sensors"
+            else:
+                group = "Appliances"
+            if not dname:
+                dname = primary["name"]
+            devices.append({
+                "id": key,
+                "name": dname,
+                "group": group,
+                "primary": primary,
+                "controls": controls[:12],
+                "status": (statuses[0] if statuses else None),
+            })
+        devices.sort(key=lambda d: (
+            _AD_GROUP_ORDER.index(d["group"]) if d["group"] in _AD_GROUP_ORDER else 99,
+            d["name"].lower()))
+        connection.send_result(msg["id"], {
+            "area_id": area_id,
+            "name": _area_name(hass, area_id),
+            "devices": devices,
+        })
+    except Exception as exc:
+        _LOGGER.warning("ws_area_devices failed: %s", exc)
+        connection.send_error(msg["id"], "area_devices_failed", str(exc))
 
 
 @websocket_api.websocket_command({

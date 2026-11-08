@@ -458,6 +458,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             pass
         return None
 
+    def _camera_on_same_device(sensor_id: str) -> str | None:
+        """The camera entity on the same HA device as this motion sensor."""
+        try:
+            from homeassistant.helpers import entity_registry as _er
+            reg = _er.async_get(hass)
+            ent = reg.async_get(sensor_id)
+            if not ent or not ent.device_id:
+                return None
+            for e in _er.async_entries_for_device(reg, ent.device_id):
+                if e.entity_id.startswith("camera."):
+                    return e.entity_id
+        except Exception:
+            pass
+        return None
+
+    async def _analyze_after_new_capture(cam: str, honorific: str) -> None:
+        """Cloud cameras (Arlo) only have the new picture once the clip is
+        recorded, so wait for the camera's capture marker (image_source) to
+        change before analysing; analysing at the motion edge would look at
+        the PREVIOUS capture. Cameras without that marker go straight through."""
+        import asyncio as _asyncio
+        try:
+            st = hass.states.get(cam)
+            marker = st.attributes.get("image_source") if st else None
+            if marker is not None:
+                for _ in range(75):          # up to ~150 s
+                    await _asyncio.sleep(2)
+                    cur = hass.states.get(cam)
+                    if cur is not None and cur.attributes.get("image_source") != marker:
+                        break
+                else:
+                    _LOGGER.debug("JARVIS motion vision: no new capture on %s; skipped", cam)
+                    return
+                await _asyncio.sleep(2)      # let the thumbnail settle
+            await async_auto_analyze_on_event(
+                hass, _current_client(), honorific, None, [], cam,
+                "Motion detected", doorbell=False, announce=False,
+            )
+        except Exception as exc:
+            _LOGGER.debug("JARVIS motion vision (after capture) error: %s", exc)
+
     @callback
     def _auto_ha_motion(event) -> None:
         if not _auto_flag("camera_motion_vision", False):
@@ -472,11 +513,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return  # only the off→on edge
             if new.attributes.get("device_class") not in _MOTION_CLASSES:
                 return
-            from .audio_routing import entity_area
-            area_id = entity_area(hass, new.entity_id)
-            if not area_id:
-                return
-            cam = _camera_covering_area(area_id)
+            # CAM-3 (dthomas946 fork): a motion sensor that belongs to a
+            # camera device (Arlo) maps to THAT camera, not whichever camera
+            # happens to share the area.
+            cam = _camera_on_same_device(new.entity_id)
+            if not cam:
+                from .audio_routing import entity_area
+                area_id = entity_area(hass, new.entity_id)
+                if not area_id:
+                    return
+                cam = _camera_covering_area(area_id)
             if not cam or not hass.states.get(cam):
                 return
             now = _auto_time.monotonic()
@@ -484,12 +530,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return
             _motion_vision_cd[cam] = now
             honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
-            hass.async_create_task(
-                async_auto_analyze_on_event(
-                    hass, _current_client(), honorific, None, [], cam,
-                    "Motion detected", doorbell=False, announce=False,
-                )
-            )
+            hass.async_create_task(_analyze_after_new_capture(cam, honorific))
         except Exception as exc:
             _LOGGER.debug("JARVIS auto-analyze (HA motion) error: %s", exc)
 
