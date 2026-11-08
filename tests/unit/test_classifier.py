@@ -231,3 +231,32 @@ async def test_classify_continues_when_optional_websocket_logger_is_missing(
 
     assert result == {
         "worth_considering": True, "urgency": "medium", "category": "other"}
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("entity_id", "device_class", "expected"), [
+    ("cover.garage", None,
+     {"worth_considering": True, "urgency": "medium", "category": "security",
+      "rule": "budget_fallback"}),
+    ("binary_sensor.shed", "tamper",
+     {"worth_considering": True, "urgency": "medium", "category": "security",
+      "rule": "budget_fallback"}),
+    ("vacuum.roomba", None,
+     {"worth_considering": False, "rule": "budget_exhausted"}),
+])
+async def test_classify_uses_safe_fallback_when_llm_budget_spent(
+        classifier, monkeypatch, entity_id, device_class, expected):
+    """dthomas946 fork: when the hourly LLM budget is spent, security-relevant
+    entities are still flagged and nothing calls the provider."""
+    import sys
+    import types
+
+    stub = types.ModuleType("jc.observer")
+    stub.llm_budget_ok = lambda: False
+    monkeypatch.setitem(sys.modules, "jc.observer", stub)
+    monkeypatch.setattr(sys.modules["jc"], "observer", stub, raising=False)
+    provider = FakeProvider(response={"text": '{"worth_considering":true}'})
+    result = await classifier.classify(
+        FakeHass(), provider, entity_id=entity_id, old_state="off",
+        new_state="on", device_class=device_class, now_hhmm="12:00")
+    assert result == expected
+    assert provider.calls == []

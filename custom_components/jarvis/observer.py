@@ -310,6 +310,25 @@ def _record_classifier_call() -> None:
     _STATE.classifier_timestamps.append(time.time())
 
 
+def llm_budget_ok() -> bool:
+    """True if the classifier may make one more LLM call this hour; records the
+    call when it may. Logs the cap once per window when it is reached."""
+    if _classifier_rate_limited():
+        if not _STATE.rate_limit_warn_logged:
+            _LOGGER.warning(
+                "JARVIS Observer: hit rate limit of %d classifier LLM calls/hour. "
+                "Ambiguous events now use the safe fallback (doors, locks, covers "
+                "and safety sensors are still flagged) until the window clears. "
+                "(Raise or disable via classifier_rate_limit; 0 = unlimited.)",
+                _effective_rate_limit(),
+            )
+            _STATE.rate_limit_warn_logged = True
+        return False
+    _STATE.rate_limit_warn_logged = False
+    _record_classifier_call()
+    return True
+
+
 def _debounced(entity_id: str, min_interval_s: float = 30.0) -> bool:
     now = time.time()
     last = _STATE.last_seen.get(entity_id, 0.0)
@@ -609,21 +628,10 @@ def _on_state_changed(event: Event) -> None:
     if _debounced(entity_id, interval):
         return
 
-    # Hourly rate limit — user-configurable cap to bound API cost
-    if _classifier_rate_limited():
-        if not _STATE.rate_limit_warn_logged:
-            _LOGGER.warning(
-                "JARVIS Observer: hit rate limit of %d classifier calls/hour. "
-                "Dropping further events until the window clears. "
-                "(Raise or disable via classifier_rate_limit; 0 = unlimited.)",
-                _effective_rate_limit(),
-            )
-            _STATE.rate_limit_warn_logged = True
-        return
-    # Clear the warning flag when we're back under the limit
-    _STATE.rate_limit_warn_logged = False
-    _record_classifier_call()
-
+    # dthomas946 fork: the hourly cap now applies only to real LLM classifier
+    # calls (see classifier.classify → llm_budget_ok). Rule-decided events are
+    # free and always flow, so routine noise can no longer use up the budget and
+    # cause door/lock/garage events to be dropped.
     _record_for_context(event)
     _STATE.hass.async_create_task(_process_event(event))
 

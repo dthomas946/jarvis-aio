@@ -268,7 +268,9 @@ async def test_state_handler_respects_running_filter_and_schedules_valid_event(
     event = _changed_event()
     observer._on_state_changed(event)
     assert len(fake_hass._tasks) == 1
-    assert len(observer._STATE.classifier_timestamps) == 1
+    # The hourly cap counts only real LLM classifier calls (llm_budget_ok),
+    # never events at the front door.
+    assert len(observer._STATE.classifier_timestamps) == 0
     fake_hass.close_pending()
 
 
@@ -356,11 +358,16 @@ async def test_state_handler_warns_once_at_rate_limit_then_clears(observer, fake
     limited = [True]
     monkeypatch.setattr(observer, "_classifier_rate_limited", lambda: limited[0])
     monkeypatch.setattr(observer, "_effective_rate_limit", lambda: 3)
+    # Events still flow while the LLM budget is spent ...
     observer._on_state_changed(_changed_event())
     observer._on_state_changed(_changed_event("binary_sensor.back_door"))
+    assert len(fake_hass._tasks) == 2
+    # ... and the budget gate warns once per window, then clears.
+    assert observer.llm_budget_ok() is False
+    assert observer.llm_budget_ok() is False
     assert sum("hit rate limit" in record.message for record in caplog.records) == 1
     limited[0] = False
-    observer._on_state_changed(_changed_event("binary_sensor.garage"))
+    assert observer.llm_budget_ok() is True
     assert observer._STATE.rate_limit_warn_logged is False
     fake_hass.close_pending()
 

@@ -443,9 +443,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return None
         try:
             from .audio_routing import entity_area
-            for st in hass.states.async_all("camera"):
-                if entity_area(hass, st.entity_id) == area_id:
-                    return st.entity_id
+            in_area = [st.entity_id for st in hass.states.async_all("camera")
+                       if entity_area(hass, st.entity_id) == area_id]
+            # dthomas946 fork: only a clear match. With several cameras in one
+            # area (all four Arlos are in "Doors & Locks") picking the first one
+            # would analyse the wrong camera.
+            if len(in_area) == 1:
+                return in_area[0]
         except Exception:
             pass
         try:
@@ -535,17 +539,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.debug("JARVIS auto-analyze (HA motion) error: %s", exc)
 
     try:
-        from homeassistant.helpers.event import async_track_state_change_event
-        _motion_ids = [
-            st.entity_id for st in hass.states.async_all("binary_sensor")
-            if st.attributes.get("device_class") in _MOTION_CLASSES
-        ]
-        if _motion_ids:
-            camera_unsubs.append(
-                async_track_state_change_event(hass, _motion_ids, _auto_ha_motion)
-            )
-            _LOGGER.info("JARVIS: generic-motion camera vision available (opt-in) "
-                         "watching %d motion/occupancy sensors", len(_motion_ids))
+        # dthomas946 fork: listen to state changes and pick motion sensors by
+        # device_class at event time, instead of a list frozen at startup. Cloud
+        # camera integrations (Arlo) often finish loading AFTER JARVIS, and their
+        # motion sensors were silently missing until the next reload.
+        from homeassistant.const import EVENT_STATE_CHANGED
+
+        @callback
+        def _is_motion_event(event_data) -> bool:
+            eid = event_data.get("entity_id", "")
+            if not eid.startswith("binary_sensor."):
+                return False
+            new = event_data.get("new_state")
+            return bool(new) and new.attributes.get("device_class") in _MOTION_CLASSES
+
+        camera_unsubs.append(
+            hass.bus.async_listen(EVENT_STATE_CHANGED, _auto_ha_motion,
+                                  event_filter=_is_motion_event)
+        )
+        _LOGGER.info("JARVIS: generic-motion camera vision available (opt-in) "
+                     "watching all motion/occupancy sensors")
     except Exception as exc:
         _LOGGER.debug("JARVIS: HA-motion vision listener registration failed: %s", exc)
 

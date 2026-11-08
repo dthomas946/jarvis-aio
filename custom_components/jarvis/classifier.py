@@ -168,6 +168,12 @@ def _parse_json(raw: str) -> dict:
     return {"worth_considering": False}
 
 
+# Device classes still flagged when the hourly LLM budget is spent.
+_SAFE_FALLBACK_CLASSES = ("door", "garage_door", "window", "opening", "lock",
+                          "tamper", "safety", "smoke", "gas", "moisture",
+                          "carbon_monoxide", "problem", "vibration")
+
+
 async def classify(
     hass, provider, *, entity_id: str, old_state: str, new_state: str,
     friendly_name: str = "", device_class: Optional[str] = None,
@@ -179,7 +185,20 @@ async def classify(
     if result is not None:
         return result
 
-    # Ambiguous — LLM (rare)
+    # Ambiguous — LLM (rare). dthomas946 fork: hourly LLM budget is checked
+    # here; when it's spent, security-relevant entities are still flagged.
+    try:
+        from . import observer as _obs
+        _budget = _obs.llm_budget_ok()
+    except Exception:
+        _budget = True
+    if not _budget:
+        _dom = entity_id.split(".", 1)[0]
+        if _dom in ("lock", "cover", "alarm_control_panel", "siren", "valve") or (
+                device_class or "") in _SAFE_FALLBACK_CLASSES:
+            return {"worth_considering": True, "urgency": "medium",
+                    "category": "security", "rule": "budget_fallback"}
+        return {"worth_considering": False, "rule": "budget_exhausted"}
     _LOGGER.info("Classifier LLM for: %s (%s→%s)", entity_id, old_state, new_state)
     try:
         from .websocket import jarvis_log
