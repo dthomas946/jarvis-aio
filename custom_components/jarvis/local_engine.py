@@ -469,6 +469,71 @@ def _find_entity(hass, name_fragment, domain_hint=None, learned_aliases=None):
     return None
 
 
+_KIND_WORDS = {
+    "lamp": ("light",), "lamps": ("light",), "light": ("light",), "lights": ("light",),
+    "fan": ("fan", "light"), "lock": ("lock",), "door": ("cover", "lock", "binary_sensor"),
+    "garage": ("cover",), "switch": ("switch",), "outlet": ("switch",), "plug": ("switch",),
+}
+
+
+def _state_by_area_and_kind(hass, name_frag):
+    """(entity_id, friendly_name) for "<area> <device word>" phrases, or None
+    when there is no single confident match."""
+    try:
+        words = re.sub(r"[^a-z0-9 ]", " ", (name_frag or "").lower()).split()
+        words = [w for w in words if w not in ("the", "my", "jarvis")]
+        if len(words) < 2 or words[-1] not in _KIND_WORDS:
+            return None
+        kind = words[-1]
+        area = " ".join(words[:-1])
+        for dom in _KIND_WORDS[kind]:
+            ents = _find_entities_in_area(hass, area, dom)
+            if not ents:
+                continue
+            if len(ents) == 1:
+                return ents[0]
+            stem = kind.rstrip("s")
+            named = [e for e in ents if stem in (e[1] or "").lower()]
+            if len(named) == 1:
+                return named[0]
+            return None   # several candidates: let the agent decide
+    except Exception:
+        _LOGGER.debug("area/kind state lookup failed", exc_info=True)
+    return None
+
+
+def _area_temperature(hass, name_frag, text, h="sir"):
+    """Temperature reading for a named area, or a feels-like sensor when asked.
+    Returns "" when nothing fits."""
+    try:
+        frag = re.sub(r"[^a-z0-9 ]", " ", (name_frag or "").lower())
+        frag = re.sub(r"\b(the|in|at|is|what|whats|jarvis|temperature|temp)\b", " ", frag)
+        frag = " ".join(frag.split())
+        if "feels like" in (text or "").lower():
+            for st in hass.states.async_all("sensor"):
+                nm = (st.attributes.get("friendly_name") or "").lower()
+                if ("feels like" in nm and st.attributes.get("device_class") == "temperature"
+                        and st.state not in ("unknown", "unavailable")):
+                    unit = st.attributes.get("unit_of_measurement", "°")
+                    return f"It feels like {st.state}{unit} inside, {h}."
+        if len(frag) < 3:
+            return ""
+        for eid, _fname in _find_entities_in_area(hass, frag, "sensor"):
+            st = hass.states.get(eid)
+            if (st and st.attributes.get("device_class") == "temperature"
+                    and st.state not in ("unknown", "unavailable")):
+                unit = st.attributes.get("unit_of_measurement", "°")
+                return f"The {frag} is currently {st.state}{unit}, {h}."
+        for eid, _fname in _find_entities_in_area(hass, frag, "climate"):
+            st = hass.states.get(eid)
+            cur = st.attributes.get("current_temperature") if st else None
+            if cur is not None:
+                return f"The {frag} is currently {cur}°, {h}."
+    except Exception:
+        _LOGGER.debug("area temperature lookup failed", exc_info=True)
+    return ""
+
+
 def _find_entities_in_area(hass, area_name, domain):
     results = []
     try:
@@ -738,11 +803,22 @@ def _query_resp(hass, action, entity_id, fname, h="sir"):
                       f"My pleasure, {h}.",
                       f"Anytime, {h}."])
     if action == "query_temp":
+        # Only answer from a real temperature reading. A fuzzy name match on a
+        # media player, light, or trend sensor returns "" so the request falls
+        # through to the next pattern / the agent instead of a nonsense answer.
         state = hass.states.get(entity_id)
-        if state:
+        if not state or state.state in ("unavailable", "unknown"):
+            return ""
+        if entity_id.startswith("climate."):
+            cur = state.attributes.get("current_temperature")
+            if cur is None:
+                return ""
+            return f"The temperature at {fname} is currently {cur}°, {h}."
+        if (entity_id.startswith("sensor.")
+                and state.attributes.get("device_class") == "temperature"):
             unit = state.attributes.get("unit_of_measurement", "°")
             return f"The temperature in {fname} is currently {state.state}{unit}, {h}."
-        return f"I'm unable to read the temperature for {fname} at the moment, {h}."
+        return ""
     if action == "query_state":
         state = hass.states.get(entity_id)
         if state:
@@ -1032,6 +1108,22 @@ async def try_local(hass, text, honorific="sir", force=False):
         extra_arg = groups[1] if len(groups) > 1 else None
         if not name_frag:
             continue
+        if action == "query_state":
+            # "is the living room lamp on": a trailing device word picks the
+            # domain and the named area is checked first, instead of stripping
+            # the word and fuzzy-matching any entity in the house.
+            _hit = _state_by_area_and_kind(hass, name_frag)
+            if _hit:
+                _r = _query_resp(hass, action, _hit[0], _hit[1], honorific)
+                if _r:
+                    return LocalResult(text=_r, success=True)
+        if action == "query_temp":
+            # Room temperature from a temperature sensor / thermostat in the
+            # named area; "feels like" from a feels-like sensor. Runs before
+            # the fuzzy name match (which picked an Echo Dot media player).
+            _t = _area_temperature(hass, name_frag, normalized, honorific)
+            if _t:
+                return LocalResult(text=_t, success=True)
         resolved = _find_entity(
             hass, name_frag, domain_hint, learned_aliases
         ) or _find_entity(hass, name_frag, None, learned_aliases)
