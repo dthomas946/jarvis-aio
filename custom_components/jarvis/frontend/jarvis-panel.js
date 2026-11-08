@@ -14526,7 +14526,8 @@ ${this._renderExcludedEntities(d)}
       g.items.push(d);
     });
     const states = (this._hass && this._hass.states) || {};
-    const ctl = (c) => {
+    const ctl = (c, grp) => {
+      if (grp === "Appliances") return `<button class="r1-dev-more" data-eid="${esc(c.entity_id)}" title="More controls">›</button>`;
       const st = states[c.entity_id];
       const s = st ? st.state : c.state;
       if (TOGGLE_DOMAINS[c.domain]) {
@@ -14566,10 +14567,10 @@ ${this._renderExcludedEntities(d)}
               <span class="r1-dev-n">${esc(d.name)}</span>
               <span class="r1-dev-s">${esc(statusLine)}${multi ? ` · ${d.controls.length} controls` : ""}</span>
             </button>
-            ${multi ? `<button class="r1-dev-more" data-expand="${esc(d.id)}" title="Show all controls">${this._r1DevOpen === d.id ? "▾" : "▸"}</button>` : ctl(p)}
+            ${multi ? `<button class="r1-dev-more" data-expand="${esc(d.id)}" title="Show all controls">${this._r1DevOpen === d.id ? "▾" : "▸"}</button>` : ctl(p, d.group)}
           </div>
           ${multi && this._r1DevOpen === d.id ? `<div class="r1-dev-sub">${d.controls.map(c => `
-            <div class="r1-dev sub"><button class="r1-dev-name" data-eid="${esc(c.entity_id)}"><span class="r1-dev-n">${esc(c.name)}</span><span class="r1-dev-s">${esc(statusOf(c))}</span></button>${ctl(c)}</div>`).join("")}</div>` : ""}`;
+            <div class="r1-dev sub"><button class="r1-dev-name" data-eid="${esc(c.entity_id)}"><span class="r1-dev-n">${esc(c.name)}</span><span class="r1-dev-s">${esc(statusOf(c))}</span></button>${ctl(c, d.group)}</div>`).join("")}</div>` : ""}`;
         }).join("")}
       </div>`).join("");
     box.querySelectorAll(".r1-dev-name").forEach(b => b.addEventListener("click", () => {

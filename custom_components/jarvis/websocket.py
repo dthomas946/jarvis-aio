@@ -2783,6 +2783,11 @@ _AD_GROUP_LABEL = {
 }
 _AD_GROUP_ORDER = ["Lights", "Switches", "Irrigation", "Climate", "Locks",
                    "Covers", "Fans", "Security", "Appliances", "Media", "Sensors"]
+# Kitchen/laundry appliances: status + "more controls" only in the drill-in,
+# never a one-tap power toggle (a stove should not be one stray tap away).
+_AD_APPLIANCE_WORDS = ("cooktop", "oven", "range", "stove", "washer", "dryer",
+                       "dishwasher", "fridge", "refrigerator", "freezer",
+                       "microwave", "water heater")
 _AD_STATUS_HINTS = ("power state", "any burner active", "running", "status",
                     "operating state", "state", "mode", "door", "active")
 
@@ -2877,7 +2882,12 @@ async def ws_area_devices(
             statuses.sort(key=_status_rank)
             primary = controls[0] if controls else statuses[0]
             pdom = primary["domain"]
-            if pdom in ("switch", "valve") and (
+            _dev_words = " ".join([dname, getattr(dev, "model", None) or "",
+                                   getattr(dev, "manufacturer", None) or "",
+                                   primary["name"]]).lower()
+            if any(w in _dev_words for w in _AD_APPLIANCE_WORDS):
+                group = "Appliances"
+            elif pdom in ("switch", "valve") and (
                     primary["platform"] == "rachio" or "zone" in primary["entity_id"]
                     or pdom == "valve"):
                 group = "Irrigation"
