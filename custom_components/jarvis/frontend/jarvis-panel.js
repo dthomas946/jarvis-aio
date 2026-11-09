@@ -15301,6 +15301,19 @@ ${this._renderExcludedEntities(d)}
   .faces-this { display: flex; flex-wrap: wrap; gap: 4px; }
   .faces-this .faces-this-sel { flex: 1 1 100%; }
   .faces-this .faces-this-name { flex: 1 1 60%; }
+  /* R3 MOB-1: phone portrait — room tiles never push past the screen edge.
+     Columns may shrink below their content; long names wrap instead of
+     being cut off; the layout-edit toolbar is compact and stays inside the tile. */
+  .areas > .area { min-width: 0; }
+  @media (max-width: 900px) {
+    .areas { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+    .area-name, .area-foot .area-name { white-space: normal; overflow: visible; text-overflow: clip;
+      overflow-wrap: anywhere; font-size: 11px; letter-spacing: 0.06em; line-height: 1.25; }
+    .area-foot { flex-wrap: wrap; row-gap: 4px; }
+    .area > .jl-tools { right: 4px; top: -10px; gap: 2px; padding: 2px 3px; }
+    .area > .jl-tools button { padding: 2px 5px; font-size: 9px; }
+    .area > .jl-tools .jl-handle { font-size: 13px; padding: 0 2px; }
+  }
   `;
   const origStyles = P._styles;
   P._styles = function () {

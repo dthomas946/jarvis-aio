@@ -1577,6 +1577,9 @@ PANEL_WRITABLE_KEYS = {
     "ollama_keep_alive",
     "person_honorifics",         # ID-1: {"Darin": "Sir", ...} per-person form of address
     "face_reference_limit",      # FACE-1: photos kept per person (1-4)         # AI-1: Ollama keep-loaded time (seconds; -1 = forever, or "30m")              # JSON: panel layout editor (section order/hidden, tab order/hidden)
+    "camera_push_alerts",        # CAM-6: phone alert for driveway car / unknown person / delivery
+    "camera_push_cooldown",      # CAM-6: seconds between alerts per camera + kind
+    "sentinel_ignore_entities",  # NOTIF-1: no left-open/unlocked reminders for these (interior locks)
     "floor_plan_cameras",        # JSON: placed cameras per floor (pos/angle/fov/range) (v7.17.0)
     "floor_plan_property",       # JSON: property boundary polygon {points:[[x,y],...]} (v7.22.0)
     "home_context_max_entities", # int: entity names per domain in the system prompt (0=counts only) (v7.23.1)

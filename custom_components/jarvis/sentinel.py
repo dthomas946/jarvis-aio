@@ -240,6 +240,17 @@ class JarvisSentinel:
                     )
                     self._state_start[key] = utcnow  # reset to avoid spam
 
+    def _sentinel_ignored(self, entity_id: str) -> bool:
+        """True when ``entity_id`` is in the ``sentinel_ignore_entities`` list."""
+        try:
+            raw = jarvis_config.runtime_get(
+                self.hass, self._entry, "sentinel_ignore_entities", []) if self._entry else []
+            if isinstance(raw, str):
+                raw = [x.strip() for x in raw.replace("\n", ",").split(",")]
+            return entity_id in {str(x).strip() for x in (raw or []) if str(x).strip()}
+        except Exception:
+            return False
+
     # ── Announcement ──────────────────────────────────────────────────────────
 
     async def _announce_rule(self, entity_id: str, rule: dict, minutes: int) -> None:
@@ -251,6 +262,11 @@ class JarvisSentinel:
                 return
         except Exception:
             pass
+        # NOTIF-1 (dthomas946 fork): entities the user doesn't want "left
+        # open / unlocked" reminders for (e.g. an interior bedroom door lock).
+        # They stay fully known to JARVIS; only this reminder is skipped.
+        if self._sentinel_ignored(entity_id):
+            return
         # runtime_config → config.json → options → data, via the canonical
         # resolver (immediate effect from panel toggles, no entry reload).
         if self._entry:

@@ -308,13 +308,14 @@ _SCENE_SEVERITY_RUBRIC = (
     "package, or mail dropped off or taken; an unrecognised person who comes "
     "ONTO the property or right up to the home (walking up a path, driveway, "
     "or steps; onto a porch; into a private yard) without yet engaging an "
-    "entry.\n"
+    "entry; a vehicle pulling INTO or arriving in this property's own "
+    "driveway.\n"
     "- 'routine': everything else — a recognised resident coming or going; a "
     "person, vehicle, or animal simply passing by on a street, sidewalk, road, "
     "or other public area, or merely visible in the distance or on a "
     "neighbouring property (ordinary passing foot or road traffic is routine "
     "EVEN IF the person is unrecognised); an empty or unchanged scene; a car "
-    "parked or passing; a pet or wild animal; weather, shadows, lights, or "
+    "passing by, or already parked and not moving; a pet or wild animal; weather, shadows, lights, or "
     "normal indoor activity. When unsure, choose 'routine'.\n"
     "KEY RULE: being unrecognised is NOT by itself notable or urgent. Judge by "
     "what the person is DOING and WHERE — not merely that you can't name them. "
@@ -1730,6 +1731,26 @@ async def async_analyze_camera(
                 relevant_captures.save, entity_id, single_b64, _cat, summary, _video)
     except Exception as _exc:
         _LOGGER.debug("relevant capture save failed: %s", _exc)
+    # CAM-6 (dthomas946 fork): phone alert for a car pulling into the driveway,
+    # an unrecognised person on the property, or a delivery. Automatic reviews
+    # only; animals / residents / passing traffic never alert.
+    if gate_announce:
+        try:
+            _res_seen = False
+            if _RECOGNITION_AVAILABLE:
+                try:
+                    _res_seen = bool(resident_present(hass))
+                except Exception:
+                    _res_seen = False
+            from . import camera_alerts
+            await camera_alerts.async_maybe_alert(
+                hass, lambda k, d=None: _cfg_opt(hass, k, d),
+                entity_id=entity_id, camera_name=camera_name,
+                category=str(judgment.get("category") or ""),
+                severity=str(judgment.get("severity") or ""),
+                summary=summary, resident_seen=_res_seen)
+        except Exception as _exc:
+            _LOGGER.debug("camera push alert hook failed: %s", _exc)
     # Proactive-briefing snapshot record
     try:
         from .proactive_briefing import record_snapshot

@@ -112,7 +112,11 @@ def sightings(load, monkeypatch, tmp_path):
     mod = load("face_sightings")
     monkeypatch.setattr(mod, "_dir", lambda: str(tmp_path / "frames"))
     monkeypatch.setattr(mod, "_index_path", lambda: str(tmp_path / "idx.json"))
-    return mod
+    # The in-memory sighting cache is module state: reset it so these sightings
+    # don't leak into later tests' recent_faces() results.
+    monkeypatch.setattr(mod, "_CACHE", None)
+    yield mod
+    mod._CACHE = None
 
 
 def test_sightings_add_list_flag_delete(sightings):
