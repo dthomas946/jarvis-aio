@@ -77,3 +77,47 @@ def test_send_and_cooldown():
     cfg["camera_push_alerts"] = False
     ca._last_sent.clear()
     assert asyncio.run(ca.async_maybe_alert(h, get, **kw)) is None
+
+
+# ── ENERGY-1: yesterday's electricity cost in the morning briefing ───────────
+import datetime as _dt
+
+
+
+
+class _ESt:
+    def __init__(self, state, attrs):
+        self.state = state
+        self.attributes = attrs
+
+
+class _EHass:
+    def __init__(self, st):
+        self._st = st
+        self.states = types.SimpleNamespace(get=lambda e: self._st if e == "sensor.x" else None)
+
+
+_ATTRS = {"usage_date": "2026-11-07", "kwh": 66.2, "intervals": 96, "complete_day": True,
+          "cycle_start": "2026-11-02", "cycle_kwh": 445.0, "cycle_cost_usd": 58.33}
+
+
+def test_energy_cost_line(load):
+    b = load("briefing")
+    line = b._gather_energy_cost(_EHass(_ESt("8.68", dict(_ATTRS))), "sensor.x",
+                                 today=_dt.date(2026, 11, 8))
+    assert line == ("Electricity yesterday (Saturday): 66 kWh, $8.68. "
+                    "Billing cycle since Nov 2: 445 kWh, $58.33.")
+
+
+def test_energy_cost_partial_and_stale(load):
+    b = load("briefing")
+    a = dict(_ATTRS, complete_day=False, intervals=80)
+    line = b._gather_energy_cost(_EHass(_ESt("7.10", a)), "sensor.x", today=_dt.date(2026, 11, 8))
+    assert "partial" in line and "80 of 96" in line
+    # a day older than yesterday is never reported as yesterday
+    assert b._gather_energy_cost(_EHass(_ESt("8.68", dict(_ATTRS))), "sensor.x",
+                                 today=_dt.date(2026, 11, 9)) == ""
+    assert b._gather_energy_cost(_EHass(_ESt("unavailable", dict(_ATTRS))), "sensor.x",
+                                 today=_dt.date(2026, 11, 8)) == ""
+    assert b._gather_energy_cost(_EHass(None), "sensor.x", today=_dt.date(2026, 11, 8)) == ""
+    assert b._gather_energy_cost(_EHass(None), "", today=_dt.date(2026, 11, 8)) == ""

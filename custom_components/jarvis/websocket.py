@@ -1580,6 +1580,7 @@ PANEL_WRITABLE_KEYS = {
     "camera_push_alerts",        # CAM-6: phone alert for driveway car / unknown person / delivery
     "camera_push_cooldown",      # CAM-6: seconds between alerts per camera + kind
     "sentinel_ignore_entities",  # NOTIF-1: no left-open/unlocked reminders for these (interior locks)
+    "briefing_energy_cost_entity",  # ENERGY-1: sensor with yesterday's electricity cost ("" = off)
     "floor_plan_cameras",        # JSON: placed cameras per floor (pos/angle/fov/range) (v7.17.0)
     "floor_plan_property",       # JSON: property boundary polygon {points:[[x,y],...]} (v7.22.0)
     "home_context_max_entities", # int: entity names per domain in the system prompt (0=counts only) (v7.23.1)

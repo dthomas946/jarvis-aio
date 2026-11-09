@@ -153,6 +153,71 @@ def _gather_energy_anomalies(hass: HomeAssistant) -> list[str]:
     return anomalies
 
 
+ENERGY_COST_ENTITY_DEFAULT = "sensor.electricity_cost_yesterday"
+
+
+def _energy_cost_entity(hass: HomeAssistant) -> str:
+    """Entity holding yesterday's electricity cost (config
+    ``briefing_energy_cost_entity``; '' or 'off' disables)."""
+    try:
+        from . import jarvis_config
+        from .const import DOMAIN
+        entries = hass.config_entries.async_entries(DOMAIN)
+        if entries:
+            val = jarvis_config.runtime_get(
+                hass, entries[0], "briefing_energy_cost_entity", ENERGY_COST_ENTITY_DEFAULT)
+            return "" if val is None else str(val).strip()
+    except Exception:
+        pass
+    return ENERGY_COST_ENTITY_DEFAULT
+
+
+def _money(v) -> str:
+    return f"${float(v):,.2f}"
+
+
+def _gather_energy_cost(hass: HomeAssistant, entity_id: str | None = None,
+                        today=None) -> str:
+    """ENERGY-1 (dthomas946 fork): one line with yesterday's electricity use
+    and cost, plus billing-cycle-to-date, from the Entergy pipeline sensor.
+    Returns '' when the sensor is missing, unavailable, or not for yesterday."""
+    entity_id = entity_id if entity_id is not None else _energy_cost_entity(hass)
+    if not entity_id or entity_id.lower() in ("off", "none"):
+        return ""
+    st = hass.states.get(entity_id)
+    if st is None or st.state in ("unknown", "unavailable", "", None):
+        return ""
+    try:
+        cost = float(st.state)
+    except (TypeError, ValueError):
+        return ""
+    a = st.attributes
+    today = today or dt_util.now().date()
+    try:
+        day = datetime.strptime(str(a.get("usage_date")), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return ""
+    if day != today - timedelta(days=1):
+        return ""      # stale — never report an old day as "yesterday"
+    parts = [f"Electricity yesterday ({day.strftime('%A')})"]
+    kwh = a.get("kwh")
+    use = f"{float(kwh):.0f} kWh, " if isinstance(kwh, (int, float)) else ""
+    line = f"{parts[0]}: {use}{_money(cost)}"
+    if a.get("complete_day") is False:
+        line += f" (partial — {a.get('intervals', '?')} of 96 meter readings so far)"
+    cyc = a.get("cycle_cost_usd")
+    if isinstance(cyc, (int, float)):
+        start = a.get("cycle_start")
+        try:
+            start_txt = datetime.strptime(str(start), "%Y-%m-%d").strftime("%b %-d")
+        except (TypeError, ValueError):
+            start_txt = "the cycle start"
+        ckwh = a.get("cycle_kwh")
+        cuse = f"{float(ckwh):.0f} kWh, " if isinstance(ckwh, (int, float)) else ""
+        line += f". Billing cycle since {start_txt}: {cuse}{_money(cyc)}"
+    return line + "."
+
+
 def _gather_overnight_events(hass: HomeAssistant, hours: int = 12) -> list[str]:
     """Sentinel events from the database in the last N hours."""
     import sqlite3
@@ -244,7 +309,11 @@ async def async_briefing(
         if cal_events:
             context_lines.append(f"Calendar: {', '.join(cal_events)}.")
 
+    energy_cost = ""
     if include_energy:
+        energy_cost = _gather_energy_cost(hass)
+        if energy_cost:
+            context_lines.append(energy_cost)
         energy = _gather_energy_anomalies(hass)
         if energy:
             context_lines.append(f"High power draw: {', '.join(energy)}.")
@@ -292,6 +361,9 @@ async def async_briefing(
         f"If nothing is noteworthy, say so briefly. "
         f"Your prime directive should inform what you surface — protect, steward, "
         f"anticipate. Lead with anything that affects their safety or wellbeing."
+        + (" Always include yesterday's electricity use and cost in one short "
+           "sentence, using the dollar figures given (say 'about' only if the "
+           "context marks the day partial)." if energy_cost else "")
     )
     system = build_system_prompt(hass, honorific, task)
 
