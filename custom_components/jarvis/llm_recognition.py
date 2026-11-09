@@ -74,25 +74,33 @@ def _match_sync(client, model: str, image_b64: str) -> Optional[dict]:
     match. Runs on the executor (file I/O + a blocking chat call)."""
     try:
         from . import face_roster, recognition
-        residents = face_roster.residents()
+        residents = list(face_roster.residents())
+        # FACE-1 (dthomas946 fork): named regular visitors are matched by name too
+        # (never treated as residents), and each person contributes up to two
+        # photos (e.g. a close-up and a full-body shot).
+        try:
+            from . import face_sightings
+            for v in face_sightings.visitors():
+                if v.lower() not in {r.lower() for r in residents}:
+                    residents.append(v)
+        except Exception:
+            pass
         if not residents:
             return None
-        # Only residents that actually have a reference photo enrolled.
         refs = []
         allowed = {}
+        import base64
         for name in residents:
-            path = recognition.face_reference_path(name)
-            if not path:
-                continue
-            try:
-                with open(path, "rb") as f:
-                    import base64
-                    refs.append((name, base64.b64encode(f.read()).decode()))
-                allowed[name.lower()] = name
-            except Exception:
-                continue
-            if len(refs) >= _MAX_REFERENCES:
-                break
+            paths = recognition.face_reference_paths(name)[:2]
+            for path in paths:
+                if len(refs) >= _MAX_REFERENCES:
+                    break
+                try:
+                    with open(path, "rb") as f:
+                        refs.append((name, base64.b64encode(f.read()).decode()))
+                    allowed[name.lower()] = name
+                except Exception:
+                    continue
         if not refs:
             return None
 
@@ -110,7 +118,7 @@ def _match_sync(client, model: str, image_b64: str) -> Optional[dict]:
         content.append({"type": "text", "text": "Current camera frame:"})
         content.append({"type": "image_url",
                         "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
-        names = ", ".join(n for n, _ in refs)
+        names = ", ".join(dict.fromkeys(n for n, _ in refs))
         content.append({"type": "text", "text": (
             f'Reply with ONLY a compact JSON object: {{"name": "<one of: {names} '
             f'| unknown>", "confidence": <integer 0-100>}}. Name a resident only '

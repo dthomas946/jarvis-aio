@@ -524,6 +524,100 @@ def _schedule_face_capture(hass, camera: str, name: str, confidence: float) -> N
 
 
 # ── Resident reference photos for best-effort LLM recognition (#140 Phase 3) ────
+def _ref_limit() -> int:
+    """Photos kept per person (FACE-1, dthomas946 fork). 1 = upstream behaviour."""
+    try:
+        from . import jarvis_config
+        n = int(jarvis_config.get("face_reference_limit", 4) or 4)
+        return max(1, min(4, n))
+    except Exception:
+        return 4
+
+
+def _extra_ref_paths(key: str) -> list[str]:
+    """Existing extra reference photos for a key: <key>__2.jpg .. <key>__4.jpg."""
+    out = []
+    for i in range(2, 5):
+        p = os.path.join(FACE_REF_DIR, f"{key}__{i}.jpg")
+        if os.path.exists(p):
+            out.append(p)
+    return out
+
+
+def face_reference_paths(name: str) -> list[str]:
+    """Every reference photo for ``name``, main first, then extras newest first."""
+    try:
+        key = _face_norm(name)
+        if not key:
+            return []
+        main = os.path.join(FACE_REF_DIR, f"{key}.jpg")
+        extras = sorted(_extra_ref_paths(key), key=os.path.getmtime, reverse=True)
+        return ([main] if os.path.exists(main) else []) + extras
+    except Exception:
+        return []
+
+
+def add_face_reference(name: str, jpeg: bytes) -> bool:
+    """FACE-1: ADD a reference photo for ``name`` (main slot first, then extra
+    slots up to the limit; when full the oldest extra is replaced). Executor
+    only. Never raises."""
+    try:
+        key = _face_norm(name)
+        if not key or not jpeg:
+            return False
+        main = os.path.join(FACE_REF_DIR, f"{key}.jpg")
+        limit = _ref_limit()
+        if not os.path.exists(main) or limit <= 1:
+            return set_face_reference(name, jpeg)
+        os.makedirs(FACE_REF_DIR, exist_ok=True)
+        slot = None
+        for i in range(2, limit + 1):
+            p = os.path.join(FACE_REF_DIR, f"{key}__{i}.jpg")
+            if not os.path.exists(p):
+                slot = p
+                break
+        if slot is None:
+            extras = _extra_ref_paths(key)
+            slot = min(extras, key=os.path.getmtime) if extras else main
+        tmp = slot + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(jpeg)
+        os.replace(tmp, slot)
+        return True
+    except Exception as exc:
+        _LOGGER.debug("add_face_reference failed for %s: %s", name, exc)
+        return False
+
+
+def remove_face_reference_slot(name: str, index: int) -> bool:
+    """Remove one photo (index into face_reference_paths). Removing the main
+    photo promotes the newest extra to main so the person keeps a reference."""
+    try:
+        paths = face_reference_paths(name)
+        if index < 0 or index >= len(paths):
+            return False
+        target = paths[index]
+        key = _face_norm(name)
+        main = os.path.join(FACE_REF_DIR, f"{key}.jpg")
+        os.remove(target)
+        if target == main:
+            extras = sorted(_extra_ref_paths(key), key=os.path.getmtime, reverse=True)
+            if extras:
+                os.replace(extras[0], main)
+        return True
+    except Exception:
+        return False
+
+
+def read_reference_slot(name: str, index: int) -> bytes:
+    try:
+        paths = face_reference_paths(name)
+        with open(paths[index], "rb") as f:
+            return f.read()
+    except Exception:
+        return b""
+
+
 def set_face_reference(name: str, jpeg: bytes) -> bool:
     """Store an enrollment reference photo for ``name`` at
     ``<config>/jarvis/faces_ref/<norm>.jpg``. Returns True on success. Does file
@@ -577,6 +671,12 @@ def remove_face_reference(name: str) -> bool:
         if not path:
             return False
         os.remove(path)
+        # FACE-1: remove the person's extra photos too.
+        try:
+            for extra in _extra_ref_paths(_face_norm(name)):
+                os.remove(extra)
+        except Exception:
+            pass
         try:
             marker = _auto_ref_marker_path(name)
             if marker and os.path.exists(marker):
@@ -593,9 +693,25 @@ def list_face_references() -> list[str]:
     try:
         if not os.path.isdir(FACE_REF_DIR):
             return []
-        return sorted(f[:-4] for f in os.listdir(FACE_REF_DIR) if f.endswith(".jpg"))
+        # FACE-1: extra photos are <key>__N.jpg — list each person once.
+        return sorted({f[:-4].split("__", 1)[0] for f in os.listdir(FACE_REF_DIR)
+                       if f.endswith(".jpg")})
     except Exception:
         return []
+
+
+def reference_counts() -> dict[str, int]:
+    """FACE-1: photos per normalized name."""
+    out: dict[str, int] = {}
+    try:
+        if os.path.isdir(FACE_REF_DIR):
+            for f in os.listdir(FACE_REF_DIR):
+                if f.endswith(".jpg"):
+                    k = f[:-4].split("__", 1)[0]
+                    out[k] = out.get(k, 0) + 1
+    except Exception:
+        pass
+    return out
 
 
 # ── Auto-enrolled LLM references (#140 Phase 3 "training") ───────────────────────
@@ -746,6 +862,12 @@ async def capture_unknown_snapshot(hass, camera: str, image_b64: str) -> Optiona
         await hass.async_add_executor_job(_store_face_snapshot, path, content)
         url = f"{FACE_SNAPSHOT_URL_BASE}/{key}.jpg"
         remember_unknown_face(entity_id, url)
+        # FACE-1 (dthomas946 fork): keep a labelable history of unknown sightings.
+        try:
+            from . import face_sightings
+            await hass.async_add_executor_job(face_sightings.add_sighting, entity_id, content)
+        except Exception:
+            pass
         return url
     except Exception as exc:
         _LOGGER.debug("capture_unknown_snapshot failed for %s: %s", camera, exc)
@@ -962,6 +1084,30 @@ def recent_faces(hass: HomeAssistant, limit: int = 20) -> list[dict]:
         # row (a real recognition / LLM guess covers it), and carries the pinned
         # frame so "Label as…" enrolls the actual sighting. Never feeds intrusion.
         named_cams = {cam for (_n, cam) in rows.keys()}
+        # FACE-1 (dthomas946 fork): one row per persisted unknown sighting.
+        try:
+            from . import face_sightings
+            for s in face_sightings.list_sightings():
+                rows[("sighting", s["id"])] = {
+                    "name": "Flagged" if s.get("status") == "flagged" else "Unknown",
+                    "camera_entity": s.get("camera_entity"),
+                    "camera": (s.get("camera_entity") or "").split(".", 1)[-1],
+                    "confidence": 0.0,
+                    "age_seconds": s.get("age_seconds", 0),
+                    "is_unknown": True,
+                    "is_resident": False,
+                    "relationship": "flagged" if s.get("status") == "flagged" else "unknown",
+                    "snapshot_url": None,     # private; panel fetches by sighting_id
+                    "is_low_confidence": False,
+                    "source": "sighting",
+                    "sighting_id": s["id"],
+                    "flagged": s.get("status") == "flagged",
+                }
+            if any(k[0] == "sighting" for k in rows):
+                named_cams = named_cams | {r.get("camera_entity") for k, r in rows.items()
+                                           if k[0] == "sighting"}
+        except Exception:
+            pass
         for cam, rec in _UNKNOWN_FACE_CACHE.items():
             ts = rec.get("ts")
             if ts and (now - ts) > CACHE_MAX_AGE:

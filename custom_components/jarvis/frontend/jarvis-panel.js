@@ -2388,7 +2388,7 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
     } catch (err) {
       this._chatMessages.push({
         role: "error",
-        text: "Couldn't reach JARVIS — " + (err?.message || String(err)),
+        text: (this._r2ChatError ? this._r2ChatError(err) : "Couldn't reach JARVIS — " + (err?.message || String(err))),
       });
     } finally {
       this._chatBusy = false;
@@ -9479,6 +9479,9 @@ ${this._renderExcludedEntities(d)}
     const refSet = new Set((Array.isArray(f.references) ? f.references : []).map(x => String(x).toLowerCase()));
     const autoRefSet = new Set((Array.isArray(f.auto_references) ? f.auto_references : []).map(x => String(x).toLowerCase()));
     const llmOn = !!f.llm_face_recognition;
+    // FACE-1 (dthomas946 fork): photos per person.
+    const refCounts = (f.reference_counts && typeof f.reference_counts === "object") ? f.reference_counts : {};
+    const refLimit = Number(f.reference_limit || 4);
     const countEl = this.shadowRoot?.getElementById("faces-count");
     if (countEl) countEl.textContent = `◉ ${residents.length} RESIDENT${residents.length === 1 ? "" : "S"}`;
 
@@ -9510,6 +9513,8 @@ ${this._renderExcludedEntities(d)}
           ref_name: n,
           has_ref: refSet.has(this._faceNorm(n)),
           auto_ref: autoRefSet.has(this._faceNorm(n)),
+          ref_count: Number(refCounts[this._faceNorm(n)] || 0),
+          ref_limit: refLimit,
           ref_hint: llmOn,
           // Enroll straight from the camera that last saw them (#140).
           can_capture: !!(seen && seen.camera_entity),
@@ -9540,7 +9545,11 @@ ${this._renderExcludedEntities(d)}
         source: r.source,
         actions: r.is_unknown ? [] : [{ label: "+ Resident", kind: "add", name: r.name }],
         // Free-text "Name this face" field (residents offered as suggestions).
-        labelable: true,
+        // FACE-1: a persisted unknown sighting gets the "This is…" choices instead.
+        labelable: !r.sighting_id,
+        sighting_id: r.sighting_id || "",
+        flagged: !!r.flagged,
+        residents,
       })).join("") + `</div>`;
     } else {
       html += `<div class="mmwave-empty">No guests or unknown faces seen recently. When your backend names a face that isn't a resident, it appears here as a guest.</div>`;
@@ -9558,6 +9567,18 @@ ${this._renderExcludedEntities(d)}
       + `</datalist>`;
 
     body.innerHTML = html;
+    // FACE-1 (dthomas946 fork): private sighting frames, photo strips, "This is…".
+    body.querySelectorAll("img[data-faces-sighting]").forEach(img =>
+      this._loadFaceSighting(img.getAttribute("data-faces-sighting"), img));
+    body.querySelectorAll("[data-faces-refs]").forEach(strip =>
+      this._renderRefStrip(strip.getAttribute("data-faces-refs"), Number(strip.getAttribute("data-count") || 0), strip));
+    body.querySelectorAll(".faces-this").forEach(box => {
+      const sel = box.querySelector(".faces-this-sel");
+      const nm = box.querySelector(".faces-this-name");
+      sel.addEventListener("change", () => { nm.style.display = sel.value === "visitor" ? "" : "none"; });
+      box.querySelector(".faces-this-ok").addEventListener("click", () =>
+        this._labelSighting(box.getAttribute("data-sid"), sel.value, nm.value));
+    });
     body.querySelectorAll("[data-faces-add]").forEach(el =>
       el.addEventListener("click", () => this._facesAction("add_resident", el.getAttribute("data-faces-add"))));
     body.querySelectorAll("[data-faces-remove]").forEach(el =>
@@ -9630,9 +9651,9 @@ ${this._renderExcludedEntities(d)}
         fr.onerror = reject;
         fr.readAsDataURL(file);
       });
-      await this._hass.callWS({ type: "jarvis/faces", action: "set_reference", name, image: b64 });
+      await this._hass.callWS({ type: "jarvis/faces", action: "add_reference", name, image: b64 });
       if (this._faceRefs) delete this._faceRefs[name];   // show the new photo, not a cached one
-      this._toast(`✓ reference photo set for ${name}`, "ok");
+      this._toast(`✓ photo added for ${name}`, "ok");
       await this._fetchFaces();
     } catch (err) {
       this._toast(`✗ ${err?.message || err}`, "err");
@@ -9678,7 +9699,7 @@ ${this._renderExcludedEntities(d)}
     try {
       const image = await this._captureFaceImage(cardEl);
       if (!image) { this._toast("✗ no snapshot available to assign", "err"); return; }
-      await this._hass.callWS({ type: "jarvis/faces", action: "set_reference", name, image });
+      await this._hass.callWS({ type: "jarvis/faces", action: "add_reference", name, image });
       if (this._faceRefs) delete this._faceRefs[name];
       this._toast(`✓ reference photo set for ${name} from this sighting`, "ok");
       await this._fetchFaces();
@@ -9699,7 +9720,7 @@ ${this._renderExcludedEntities(d)}
       const res = await this._hass.callWS({ type: "jarvis/camera_snapshot", entity_id: cameraEntity });
       if (!res?.image) { this._toast("✗ no frame from that camera", "err"); return; }
       const image = `data:image/jpeg;base64,${res.image}`;
-      await this._hass.callWS({ type: "jarvis/faces", action: "set_reference", name, image });
+      await this._hass.callWS({ type: "jarvis/faces", action: "add_reference", name, image });
       if (this._faceRefs) delete this._faceRefs[name];
       this._toast(`✓ reference photo set for ${name} from ${String(cameraEntity).replace(/^camera\./, "")}`, "ok");
       await this._fetchFaces();
@@ -9753,9 +9774,68 @@ ${this._renderExcludedEntities(d)}
   }
 
   // One face card: snapshot (or an initial placeholder) with the name under it.
+  // ── FACE-1 helpers (dthomas946 fork) ──
+  async _loadFaceSighting(sid, img) {
+    if (!sid || !img || !this._hass) return;
+    this._sightImgs = this._sightImgs || {};
+    const show = (u) => {
+      if (!u || !img.isConnected) return;
+      img.src = u; img.style.display = "";
+      const ph = img.parentElement?.querySelector(".faces-thumb-ph");
+      if (ph) ph.style.display = "none";
+    };
+    if (this._sightImgs[sid]) { show(this._sightImgs[sid]); return; }
+    try {
+      const res = await this._hass.callWS({ type: "jarvis/face_reference", sighting_id: sid });
+      if (res?.image) { this._sightImgs[sid] = res.image; show(res.image); }
+    } catch (_) { /* leave the placeholder */ }
+  }
+
+  async _renderRefStrip(name, count, strip) {
+    if (!name || !strip || !this._hass) return;
+    strip.innerHTML = Array.from({ length: count }, (_, i) =>
+      `<span class="faces-refthumb"><img data-i="${i}" alt=""/><button type="button" data-i="${i}" title="Remove this photo">✕</button></span>`).join("");
+    strip.querySelectorAll("button[data-i]").forEach(b => b.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!window.confirm(`Remove photo ${Number(b.dataset.i) + 1} of ${name}?`)) return;
+      try {
+        await this._hass.callWS({ type: "jarvis/faces", action: "remove_reference_slot", name, index: Number(b.dataset.i) });
+        if (this._faceRefs) delete this._faceRefs[name];
+        this._toast(`✓ photo removed`, "ok");
+        await this._fetchFaces();
+      } catch (err) { this._toast(`✗ ${err?.message || err}`, "err"); }
+    }));
+    for (let i = 0; i < count; i++) {
+      try {
+        const res = await this._hass.callWS({ type: "jarvis/face_reference", name, index: i });
+        const im = strip.querySelector(`img[data-i="${i}"]`);
+        if (im && res?.image) im.src = res.image;
+      } catch (_) { /* skip */ }
+    }
+  }
+
+  async _labelSighting(sid, choice, visitorName) {
+    if (!sid || !choice) { this._toast("Pick who this is first", "err"); return; }
+    let kind = choice, name = "";
+    if (choice.startsWith("resident:")) { kind = "resident"; name = choice.slice(9); }
+    if (kind === "visitor") {
+      name = String(visitorName || "").trim();
+      if (!name) { this._toast("Type the visitor's name", "err"); return; }
+    }
+    try {
+      await this._hass.callWS({ type: "jarvis/faces", action: "label_sighting", sighting_id: sid, kind, name });
+      const msg = { resident: `✓ added as a photo of ${name}`, visitor: `✓ saved as visitor ${name}`,
+        delivery: "✓ logged as a delivery / service visit (face not kept)", ignore: "✓ removed",
+        flag: "⚑ flagged for attention" }[kind] || "✓ done";
+      if (name && this._faceRefs) delete this._faceRefs[name];
+      this._toast(msg, kind === "flag" ? "err" : "ok");
+      await this._fetchFaces();
+    } catch (err) { this._toast(`✗ ${err?.message || err}`, "err"); }
+  }
+
   _faceCard({ name, camera_entity, camera, confidence, age_seconds, relation, actions,
               snapshot_url, low_conf, source, ref_name, has_ref, auto_ref, ref_hint,
-              labelable, can_capture }) {
+              labelable, can_capture, sighting_id, flagged, residents, ref_count, ref_limit }) {
     const safe = this._esc(name || "Unknown");
     const initial = this._esc((name || "?").trim().charAt(0).toUpperCase() || "?");
     let badge = relation === "resident" ? `<span class="faces-badge resident">RESIDENT</span>`
@@ -9763,6 +9843,7 @@ ${this._renderExcludedEntities(d)}
       : relation === "guest" ? `<span class="faces-badge guest">GUEST</span>` : "";
     // A best-effort LLM guess is flagged distinctly and never looks authoritative.
     if (low_conf) badge = `<span class="faces-badge guess">LLM GUESS</span>`;
+    if (flagged) badge = `<span class="faces-badge flagged">FLAGGED</span>`;
     // Which backend named this face (Frigate / Double Take / generic). Not shown
     // for an LLM guess (its badge already says so) or an unlabelled unknown.
     const srcLabel = low_conf ? "" : this._faceSourceLabel(source);
@@ -9772,7 +9853,9 @@ ${this._renderExcludedEntities(d)}
     // Thumbnail priority: a pinned recognition-time sighting → the enrolled
     // reference photo the user uploaded (#394: it must actually show up) → a
     // live frame from the camera that saw them → an initial-letter avatar.
-    const thumb = snapshot_url
+    const thumb = sighting_id
+      ? `<img class="faces-thumb-img" data-faces-sighting="${this._esc(sighting_id)}" alt="${safe}" style="display:none"/><div class="faces-thumb-ph">${initial}</div>`
+      : snapshot_url
       ? `<img class="faces-thumb-img" src="${this._esc(snapshot_url)}" alt="${safe}"/>`
       : (has_ref && ref_name)
         ? `<img class="faces-thumb-img" data-faces-refimg="${this._esc(ref_name)}" alt="${safe}" style="display:none"/><div class="faces-thumb-ph">${initial}</div>`
@@ -9791,7 +9874,10 @@ ${this._renderExcludedEntities(d)}
     // Reference-photo control for resident cards (enrollment for the LLM matcher).
     let refCtl = "";
     if (ref_name) {
-      const lbl = has_ref ? "📷 Change photo" : "📷 Set photo";
+      // FACE-1: photos are added, not replaced (up to the limit).
+      const n = Number(ref_count || (has_ref ? 1 : 0));
+      const lim = Number(ref_limit || 4);
+      const lbl = n ? `📷 Add photo (${n}/${lim})` : "📷 Add photo";
       refCtl = `<label class="faces-ref ${has_ref ? "set" : ""}"${ref_hint && !has_ref ? ' title="Add a reference photo to let best-effort recognition match this resident"' : ""}>${lbl}`
         + `<input type="file" accept="image/*" data-faces-ref="${this._esc(ref_name)}" style="display:none"/></label>`;
       // An auto-enrolled reference (captured from a confident backend recognition)
@@ -9803,7 +9889,10 @@ ${this._renderExcludedEntities(d)}
       // On-the-fly: enroll this resident's reference straight from the frame that
       // last saw them, no file upload needed (#140).
       if (can_capture) {
-        refCtl += `<button class="faces-ref faces-cap" data-faces-capture="${this._esc(ref_name)}" title="Use this sighting as the reference photo">📷 From sighting</button>`;
+        refCtl += `<button class="faces-ref faces-cap" data-faces-capture="${this._esc(ref_name)}" title="Add this sighting as a reference photo">📷 From sighting</button>`;
+      }
+      if (n) {
+        refCtl += `<div class="faces-refs" data-faces-refs="${this._esc(ref_name)}" data-count="${n}"></div>`;
       }
     }
     // Snapshot-from-camera-now (#140): enroll a reference from a live frame off
@@ -9828,7 +9917,24 @@ ${this._renderExcludedEntities(d)}
     // reference photo. Unlike the old residents-only dropdown, you can name a NEW
     // person, and it sits right under the snapshot for quick identification.
     let labelCtl = "";
-    if (labelable) {
+    if (sighting_id) {
+      // FACE-1 "This is…": a household member, a named regular visitor, a
+      // delivery / service visit (face not kept), ignore, or flag.
+      const opts = (residents || []).map(n =>
+        `<option value="resident:${this._esc(n)}">${this._esc(n)}</option>`).join("");
+      labelCtl = `<div class="faces-card-label faces-this" data-sid="${this._esc(sighting_id)}">`
+        + `<select class="faces-assign-sel faces-this-sel" aria-label="Who is this?">`
+        + `<option value="">This is…</option>`
+        + (opts ? `<optgroup label="Household">${opts}</optgroup>` : "")
+        + `<option value="visitor">Regular visitor (type a name)</option>`
+        + `<option value="delivery">Delivery / service — don't keep face</option>`
+        + `<option value="ignore">Unknown — ignore</option>`
+        + (flagged ? "" : `<option value="flag">Unknown — flag for attention</option>`)
+        + `</select>`
+        + `<input class="faces-label-input faces-this-name" type="text" placeholder="Visitor's name" style="display:none"/>`
+        + `<button class="btn faces-mark faces-this-ok" type="button">OK</button>`
+        + `</div>`;
+    } else if (labelable) {
       labelCtl = `<div class="faces-card-label">`
         + `<input class="faces-label-input" type="text" list="faces-names-dl" placeholder="Name this face…" aria-label="Name this face"/>`
         + `<button class="btn faces-mark faces-label-btn" data-faces-label="1">Label</button>`
@@ -14520,7 +14626,7 @@ ${this._renderExcludedEntities(d)}
     if (hit.error) { box.innerHTML = `<div class="r1-dev-empty">Couldn't load devices — ${esc(hit.error)}</div>`; return; }
     if (!hit.devices.length) { box.innerHTML = `<div class="r1-dev-empty">No devices assigned to this room in Home Assistant.</div>`; return; }
     const groups = [];
-    hit.devices.forEach(d => {
+    (this._r2TuneDevices ? this._r2TuneDevices(areaId, hit.devices) : hit.devices).forEach(d => {
       let g = groups.find(x => x.name === d.group);
       if (!g) { g = { name: d.group, items: [] }; groups.push(g); }
       g.items.push(d);
@@ -14559,7 +14665,10 @@ ${this._renderExcludedEntities(d)}
         <div class="r1-dev-gname">${esc(g.name)} <span>${g.items.length}</span></div>
         ${g.items.map(d => {
           const p = d.primary;
-          const multi = (d.controls || []).length > 1;
+          const ctls = d.controls || [];
+          // AREA-4: an appliance leads with its status; its switches sit behind ▸.
+          const multi = ctls.length > 1 || (d.group === "Appliances" && ctls.length >= 1
+            && !ctls.some(c => c.entity_id === p.entity_id));
           const statusLine = (d.status && d.status.entity_id !== p.entity_id && !TOGGLE_DOMAINS[p.domain])
             ? statusOf(d.status) : statusOf(p);
           return `<div class="r1-dev" data-dev="${esc(d.id)}">
@@ -14735,6 +14844,463 @@ ${this._renderExcludedEntities(d)}
   .r1-dev-tgl.on { color: var(--amber); border-color: rgba(255,180,84,0.6); background: rgba(255,180,84,0.08); }
   .r1-dev-act { color: var(--cyan); border-color: var(--cyan-dim); }
   .r1-dev-more { min-width: 30px; font-size: 13px; padding: 1px 8px; }
+  `;
+  const origStyles = P._styles;
+  P._styles = function () {
+    return origStyles.apply(this, arguments).replace(/<\/style>\s*$/, CSS + "</style>");
+  };
+})();
+
+// ═══ RELEASE 2 (dthomas946 fork) ═════════════════════════════════════════════
+// CAM-4   Camera Watch shows the camera's last person / vehicle / delivery
+//         capture (animal-only clips are skipped by the backend).
+// CAM-5   Tap the picture (or ▶ CLIP) to play that recorded clip.
+// ACT-4   Activity Feed: IMPORTANT / ALL switch that works both ways.
+// AREA-1  Room tiles can be dragged / moved / hidden in ⇅ LAYOUT mode.
+// AREA-3  A room's device list can be reordered, trimmed and given pinned
+//         devices from other rooms (✎ EDIT LIST in the room drill-in).
+// CHAT-1  Chat errors in plain words.
+(() => {
+  const P = (typeof JarvisPanel !== "undefined") ? JarvisPanel.prototype : null;
+  if (!P || P._r2Installed) return;
+  P._r2Installed = true;
+
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  // ── CHAT-1 ──────────────────────────────────────────────────────────────────
+  P._r2ChatError = function (err) {
+    const code = err && (err.code != null ? String(err.code) : "");
+    const msg = err && (err.message || err.error || "");
+    if (/timeout|timed out/i.test(String(msg)) || code === "timeout")
+      return "JARVIS took too long to answer. Try again, or ask something shorter.";
+    if (code === "3" || /connection lost|not connected/i.test(String(msg)))
+      return "Lost the connection to Home Assistant (it may be restarting). Try again in a minute.";
+    if (msg) return "JARVIS couldn't answer: " + msg;
+    if (code) return "JARVIS couldn't answer (error " + code + ").";
+    try { return "JARVIS couldn't answer: " + JSON.stringify(err); } catch (_) { return "JARVIS couldn't answer."; }
+  };
+
+  // ── ACT-4: IMPORTANT / ALL switch ───────────────────────────────────────────
+  P._r1DecorateActivity = function () {
+    const root = this.shadowRoot;
+    const head = root && root.querySelector(".c-log .head");
+    if (!head) return;
+    let seg = head.querySelector(".r2-act-seg");
+    if (!seg) {
+      head.querySelectorAll(".r1-act-all").forEach(b => b.remove());
+      seg = document.createElement("span");
+      seg.className = "r2-act-seg";
+      seg.innerHTML = `<button type="button" data-v="imp" title="Alerts, problems and your conversations">IMPORTANT</button>`
+        + `<button type="button" data-v="all" title="Every event, including routine ones JARVIS ignored">ALL</button>`;
+      seg.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-v]");
+        if (!b) return;
+        this._r1ActAll = b.dataset.v === "all";
+        this._r2PaintActSeg(seg);
+        this._updateActivityFeed();
+      });
+      head.insertBefore(seg, head.querySelector(".side") || null);
+    }
+    this._r2PaintActSeg(seg);
+    this._updateActivityFeed();
+  };
+  P._r2PaintActSeg = function (seg) {
+    seg.querySelectorAll("button[data-v]").forEach(b =>
+      b.classList.toggle("on", (b.dataset.v === "all") === !!this._r1ActAll));
+  };
+
+  // ── CAM-4 / CAM-5 ───────────────────────────────────────────────────────────
+  const REL_TTL = 45000;
+  const REL_LABEL = { person: "LAST PERSON", known_resident: "LAST PERSON", vehicle: "LAST VEHICLE",
+    delivery: "LAST DELIVERY", package: "LAST DELIVERY", mail: "LAST DELIVERY" };
+
+  P._r2Relevant = function (entity) {
+    this._r2Rel = this._r2Rel || {};
+    const hit = this._r2Rel[entity];
+    if ((!hit || Date.now() - hit.at > REL_TTL) && !(hit && hit.loading) && this._hass) {
+      this._r2Rel[entity] = { ...(hit || {}), loading: true, at: hit ? hit.at : 0 };
+      this._hass.callWS({ type: "jarvis/camera_relevant", entity_id: entity }).then(res => {
+        this._r2Rel[entity] = { at: Date.now(), data: (res && res.capture) || null };
+      }).catch(() => {
+        this._r2Rel[entity] = { at: Date.now(), data: null };
+      }).finally(() => {
+        if (this._activeCam === entity) this._r1PaintCamLabels();
+      });
+    }
+    return hit && hit.data ? hit.data : null;
+  };
+
+  const hhmm = (ts) => {
+    try {
+      const d = new Date(ts * 1000);
+      const now = new Date();
+      const t = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      if (d.toDateString() === now.toDateString()) return t;
+      return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${t}`;
+    } catch (_) { return ""; }
+  };
+
+  // Replaces Release 1's painter (same name, so every Release 1 hook uses it).
+  P._r1PaintCamLabels = function () {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const entity = this._activeCam;
+    const stateEl = root.getElementById("cam-state");
+    const stripEl = root.getElementById("cam-strip");
+    if (!entity || !stripEl) return;
+    const live = this._r1Live && this._r1Live.entity === entity ? this._r1Live : null;
+    const clip = this._r2Clip && this._r2Clip.entity === entity ? this._r2Clip : null;
+    const focus = this._camFocus && this._camFocus.entity === entity;
+    const name = this._camName ? this._camName(entity) : entity;
+    const info = this._r1CaptureInfo(entity);
+    const rel = info ? this._r2Relevant(entity) : null;
+    let html = `<span>SRC <b>${esc(name)}</b></span>`;
+    if (live) {
+      const left = live.playingAt ? Math.max(0, 60 - Math.floor((Date.now() - live.playingAt) / 1000)) : null;
+      if (stateEl) {
+        stateEl.textContent = live.playingAt ? `◉ LIVE ${left}s` : "◌ CONNECTING…";
+        stateEl.style.color = live.playingAt ? "var(--green)" : "var(--amber)";
+      }
+      html += `<span>${live.playingAt ? "LIVE STREAM" : "STARTING LIVE VIEW"}</span>`
+        + `<button class="r1-live-btn stop" type="button" data-r2="live">■ STOP</button>`;
+    } else if (clip) {
+      if (stateEl) { stateEl.textContent = "▶ CLIP"; stateEl.style.color = "var(--cyan)"; }
+      html += `<span>${esc(clip.label)} <b>${esc(clip.when)}</b></span>`
+        + `<button class="r1-live-btn stop" type="button" data-r2="clipstop">■ CLOSE CLIP</button>`
+        + `<button class="r1-live-btn" type="button" data-r2="live">▶ LIVE</button>`;
+    } else if (info) {
+      const label = rel ? (REL_LABEL[rel.category] || "LAST PERSON") : info.label;
+      const when = rel ? hhmm(rel.ts) : info.when;
+      if (stateEl && !focus) { stateEl.textContent = `◉ ${label}`; stateEl.style.color = "var(--amber)"; }
+      html += `<span title="${esc(rel ? rel.summary : "")}">${label} <b>${esc(when)}</b></span>`
+        + `<button class="r1-live-btn" type="button" data-r2="clip" title="Play the recorded clip">▶ CLIP</button>`
+        + `<button class="r1-live-btn" type="button" data-r2="live" title="Start a live view (stops after 60 seconds)">▶ LIVE</button>`;
+    } else {
+      return;   // a real streaming camera: original labels stand
+    }
+    stripEl.innerHTML = html;
+    stripEl.querySelectorAll("button[data-r2]").forEach(b => b.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const a = b.dataset.r2;
+      if (a === "live") { this._r2StopClip(true); if (this._r1Live) this._r1StopLive("stopped"); else this._r1StartLive(entity); }
+      else if (a === "clip") this._r2PlayClip(entity);
+      else if (a === "clipstop") this._r2StopClip();
+    }));
+    this._r2PaintStill();
+  };
+
+  // The still: the last relevant frame over the feed (when not live / playing).
+  P._r2PaintStill = function () {
+    const root = this.shadowRoot;
+    const feed = root && root.getElementById("cam-feed");
+    if (!feed) return;
+    const entity = this._activeCam;
+    const busy = (this._r1Live && this._r1Live.entity === entity) || (this._r2Clip && this._r2Clip.entity === entity);
+    const rel = entity && this._r1CaptureInfo(entity) ? (this._r2Rel?.[entity]?.data || null) : null;
+    let still = feed.querySelector(":scope > .r2-still");
+    if (!rel || busy) { if (still) still.remove(); }
+    else {
+      if (!still) {
+        still = document.createElement("div");
+        still.className = "r2-still";
+        still.title = "Tap to play this clip";
+        still.addEventListener("click", () => this._r2PlayClip(this._activeCam));
+        feed.appendChild(still);
+      }
+      if (still.dataset.src !== String(rel.ts)) {
+        still.dataset.src = String(rel.ts);
+        still.innerHTML = `<img alt="" src="${rel.image}"/><span class="r2-play-hint">▶</span>`;
+      }
+    }
+    // Tapping the plain last-motion picture plays the camera's latest clip too.
+    if (!feed._r2Wired) {
+      feed._r2Wired = true;
+      feed.addEventListener("click", (e) => {
+        if (e.target.closest(".r1-live, .r2-clip, .r2-still, button, .cam-tag")) return;
+        const cam = this._activeCam;
+        if (cam && this._r1CaptureInfo(cam) && !this._r1Live && !this._r2Clip) this._r2PlayClip(cam);
+      });
+    }
+  };
+
+  P._r2PlayClip = function (entity) {
+    if (!entity || !this._hass) return;
+    if (this._r1Live) this._r1StopLive();
+    this._r2StopClip(true);
+    const st = this._hass.states[entity];
+    const rel = this._r2Rel?.[entity]?.data || null;
+    const urls = [rel && rel.video_url, rel && rel.current_video_url, st && st.attributes && st.attributes.last_video]
+      .filter((u, i, a) => u && a.indexOf(u) === i);
+    if (!urls.length) { this._toast && this._toast("No recorded clip available for this camera yet.", "err"); return; }
+    const label = rel ? (REL_LABEL[rel.category] || "LAST PERSON") : "LAST MOTION";
+    const info = this._r1CaptureInfo(entity);
+    const when = rel ? hhmm(rel.ts) : (info ? info.when : "");
+    const wrap = document.createElement("div");
+    wrap.className = "r2-clip";
+    const v = document.createElement("video");
+    v.controls = true; v.autoplay = true; v.playsInline = true; v.muted = false;
+    let i = 0;
+    v.src = urls[0];
+    v.addEventListener("error", () => {
+      i += 1;
+      if (i < urls.length) { v.src = urls[i]; v.play().catch(() => {}); }
+      else { this._r2StopClip(); this._toast && this._toast("Couldn't play the clip — Arlo's link may have expired.", "err"); }
+    });
+    v.addEventListener("ended", () => this._r2StopClip());
+    const close = document.createElement("button");
+    close.type = "button"; close.className = "r2-clip-close"; close.textContent = "✕";
+    close.addEventListener("click", (e) => { e.stopPropagation(); this._r2StopClip(); });
+    wrap.appendChild(v); wrap.appendChild(close);
+    this._r2Clip = { entity, wrap, label, when };
+    const feed = this.shadowRoot && this.shadowRoot.getElementById("cam-feed");
+    if (feed) feed.appendChild(wrap);
+    v.play().catch(() => {});
+    this._r1PaintCamLabels();
+  };
+
+  P._r2StopClip = function (quiet) {
+    const c = this._r2Clip;
+    if (!c) return;
+    this._r2Clip = null;
+    try { const v = c.wrap.querySelector("video"); if (v) { v.pause(); v.removeAttribute("src"); v.load(); } } catch (_) {}
+    try { if (c.wrap.parentNode) c.wrap.parentNode.removeChild(c.wrap); } catch (_) {}
+    if (!quiet) this._r1PaintCamLabels();
+  };
+
+  // ── AREA-1: room tiles join the layout editor ───────────────────────────────
+  const origGroups = P._jlGroups;
+  if (origGroups) P._jlGroups = function (app) {
+    const groups = origGroups.call(this, app);
+    const byParent = new Map();
+    app.querySelectorAll(".area[data-area-id]").forEach(t => {
+      if (t.closest("[class*='overlay'], [class*='modal']")) return;
+      // Stable key = the room's id, so a saved order survives reloads.
+      t.dataset.jlBase = "area:" + t.dataset.areaId;
+      t.dataset.jlKey = "area:" + t.dataset.areaId;
+      const p = t.parentElement;
+      if (!p) return;
+      if (!byParent.has(p)) byParent.set(p, []);
+      byParent.get(p).push(t);
+    });
+    let n = 0;
+    for (const [container, items] of byParent) {
+      n += 1;
+      groups.push({ container, key: n > 1 ? `room-tiles#${n}` : "room-tiles", items });
+    }
+    return groups;
+  };
+
+  // In ⇅ LAYOUT mode a tap on a tile must not open its room.
+  P._r2GuardTiles = function () {
+    const app = this.shadowRoot && this.shadowRoot.querySelector(".app");
+    if (!app || app._r2Guard) return;
+    app._r2Guard = true;
+    app.addEventListener("click", (e) => {
+      if (!this._layoutEditing) return;
+      const tile = e.target.closest(".area[data-area-id]");
+      if (tile && !e.target.closest(".jl-tools")) { e.stopPropagation(); e.preventDefault(); }
+    }, true);
+  };
+
+  // ── AREA-3: tune a room's device list ───────────────────────────────────────
+  P._r2RoomCfg = function (areaId) {
+    const layout = this._jlLoad ? this._jlLoad() : (this._layout || {});
+    layout.rooms = layout.rooms || {};
+    const c = layout.rooms[areaId] || (layout.rooms[areaId] = { order: [], hidden: [], pinned: [] });
+    c.order = c.order || []; c.hidden = c.hidden || []; c.pinned = c.pinned || [];
+    return c;
+  };
+  const CONTROL_DOMAINS = ["light", "switch", "lock", "cover", "valve", "fan", "climate", "vacuum",
+    "media_player", "humidifier", "water_heater", "siren"];
+
+  P._r2TuneDevices = function (areaId, devices) {
+    const cfg = this._r2RoomCfg(areaId);
+    const states = (this._hass && this._hass.states) || {};
+    const pinned = cfg.pinned.filter(eid => states[eid]).map(eid => {
+      const st = states[eid];
+      const dom = eid.split(".")[0];
+      const row = { entity_id: eid, domain: dom, name: st.attributes.friendly_name || eid, state: st.state, status: st.state };
+      return { id: "pin:" + eid, name: row.name, group: "Pinned", primary: row,
+        controls: CONTROL_DOMAINS.includes(dom) ? [row] : [], status: null, _pinned: true };
+    });
+    const all = [...devices, ...pinned];
+    const hidden = new Set(cfg.hidden);
+    const order = cfg.order;
+    const ranked = all.map((d, i) => ({ d, rank: order.indexOf(d.id) >= 0 ? order.indexOf(d.id) : 10000 + i }));
+    const groups = [];
+    ranked.forEach(r => { if (!groups.includes(r.d.group)) groups.push(r.d.group); });
+    const out = [];
+    for (const g of groups) {
+      ranked.filter(r => r.d.group === g).sort((a, b) => a.rank - b.rank).forEach(r => {
+        const isHidden = hidden.has(r.d.id);
+        if (isHidden && !this._r2RoomEdit) return;
+        out.push({ ...r.d, _hidden: isHidden });
+      });
+    }
+    return out;
+  };
+
+  const origDevices = P._r1RenderDevices;
+  if (origDevices) P._r1RenderDevices = function () {
+    origDevices.apply(this, arguments);
+    try { this._r2DecorateDevices(); } catch (err) { console.warn("JARVIS room list edit failed", err); }
+  };
+
+  P._r2DecorateDevices = function () {
+    const box = this.shadowRoot && this.shadowRoot.getElementById("r1-devices");
+    if (!box) return;
+    const areaId = this._expandedArea;
+    if (!areaId) return;
+    const editing = !!this._r2RoomEdit;
+    const cfg = this._r2RoomCfg(areaId);
+    let bar = box.querySelector(":scope > .r2-room-bar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.className = "r2-room-bar";
+      box.insertBefore(bar, box.firstChild);
+    }
+    bar.innerHTML = `<span>${editing ? "Move, hide or pin devices for this room" : ""}</span>`
+      + `<button type="button" class="r2-room-edit">${editing ? "✓ DONE" : "✎ EDIT LIST"}</button>`;
+    bar.querySelector(".r2-room-edit").addEventListener("click", () => {
+      this._r2RoomEdit = !this._r2RoomEdit;
+      this._r1RenderDevices();
+    });
+    if (!editing) return;
+
+    const rows = Array.from(box.querySelectorAll(".r1-dev[data-dev]"));
+    rows.forEach(row => {
+      const id = row.getAttribute("data-dev");
+      const isHidden = cfg.hidden.includes(id);
+      row.classList.toggle("r2-hidden-row", isHidden);
+      const tools = document.createElement("span");
+      tools.className = "r2-row-tools";
+      const pinned = id.startsWith("pin:");
+      tools.innerHTML = `<button type="button" data-a="up" title="Move up">▲</button>`
+        + `<button type="button" data-a="down" title="Move down">▼</button>`
+        + (pinned ? `<button type="button" data-a="unpin" title="Remove from this room">UNPIN</button>`
+                  : `<button type="button" data-a="eye">${isHidden ? "SHOW" : "HIDE"}</button>`);
+      row.appendChild(tools);
+      tools.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-a]");
+        if (!b) return;
+        e.stopPropagation();
+        const a = b.dataset.a;
+        const ids = rows.map(r => r.getAttribute("data-dev"));
+        if (a === "eye") {
+          cfg.hidden = isHidden ? cfg.hidden.filter(x => x !== id) : [...cfg.hidden, id];
+        } else if (a === "unpin") {
+          cfg.pinned = cfg.pinned.filter(eid => "pin:" + eid !== id);
+          cfg.order = cfg.order.filter(x => x !== id);
+        } else {
+          const groupOf = (r) => r.closest(".r1-dev-group");
+          const sibs = rows.filter(r => groupOf(r) === groupOf(row)).map(r => r.getAttribute("data-dev"));
+          const i = sibs.indexOf(id), j = a === "up" ? i - 1 : i + 1;
+          if (j < 0 || j >= sibs.length) return;
+          const other = sibs[j];
+          const ii = ids.indexOf(id), jj = ids.indexOf(other);
+          [ids[ii], ids[jj]] = [ids[jj], ids[ii]];
+          cfg.order = ids;
+        }
+        this._jlSave && this._jlSave();
+        this._r1RenderDevices();
+      });
+    });
+
+    // Pin a device from anywhere in the house.
+    const pin = document.createElement("div");
+    pin.className = "r2-pin";
+    const states = (this._hass && this._hass.states) || {};
+    const opts = Object.keys(states)
+      .filter(eid => CONTROL_DOMAINS.includes(eid.split(".")[0]) && !cfg.pinned.includes(eid))
+      .map(eid => ({ eid, name: states[eid].attributes.friendly_name || eid }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map(o => `<option value="${esc(o.name)} — ${esc(o.eid)}"></option>`).join("");
+    pin.innerHTML = `<input type="text" list="r2-pin-dl" placeholder="Pin a device from another room…"/>`
+      + `<datalist id="r2-pin-dl">${opts}</datalist><button type="button">PIN</button>`;
+    pin.querySelector("button").addEventListener("click", () => {
+      const v = pin.querySelector("input").value || "";
+      const m = v.match(/([a-z_]+\.[a-z0-9_]+)\s*$/);
+      const eid = m ? m[1] : "";
+      if (!eid || !states[eid]) { this._toast && this._toast("Pick a device from the list", "err"); return; }
+      cfg.pinned = [...cfg.pinned, eid];
+      this._jlSave && this._jlSave();
+      this._r1RenderDevices();
+    });
+    box.appendChild(pin);
+  };
+
+  // ── hooks ────────────────────────────────────────────────────────────────────
+  const origRender = P._render;
+  P._render = function () {
+    if (this._r2Clip && this._currentTab !== "dashboard") this._r2StopClip(true);
+    const keep = this._r2Clip && this._r2Clip.wrap;
+    if (keep && keep.parentNode) keep.parentNode.removeChild(keep);
+    if (!this._expandedArea) this._r2RoomEdit = false;
+    const r = origRender.apply(this, arguments);
+    try {
+      if (keep && this._r2Clip) {
+        const feed = this.shadowRoot && this.shadowRoot.getElementById("cam-feed");
+        if (feed) feed.appendChild(keep);
+      }
+      this._r2GuardTiles();
+      this._r1PaintCamLabels();
+    } catch (err) { console.warn("JARVIS release-2 decorate failed", err); }
+    return r;
+  };
+
+  const origSelect = P._selectCam;
+  if (origSelect) P._selectCam = function (entity) {
+    if (this._r2Clip && this._r2Clip.entity !== entity) this._r2StopClip(true);
+    return origSelect.apply(this, arguments);
+  };
+
+  const origDisc = P.disconnectedCallback;
+  P.disconnectedCallback = function () {
+    try { this._r2StopClip(true); } catch (_) {}
+    return origDisc ? origDisc.apply(this, arguments) : undefined;
+  };
+
+  // ── styles ───────────────────────────────────────────────────────────────────
+  const CSS = `
+  .c-log .head .r2-act-seg { margin-left: auto; margin-right: 10px; display: inline-flex; border: 1px solid var(--line);
+    border-radius: 4px; overflow: hidden; }
+  .c-log .head .r2-act-seg button { background: transparent; border: 0; color: var(--text-dim); font-family: var(--font-mono);
+    font-size: 9px; letter-spacing: 0.14em; padding: 2px 8px; cursor: pointer; }
+  .c-log .head .r2-act-seg button + button { border-left: 1px solid var(--line); }
+  .c-log .head .r2-act-seg button.on { color: var(--cyan); background: rgba(0,242,254,0.10); }
+  .r2-still, .r2-clip { position: absolute; inset: 0; z-index: 4; background: #000; display: flex; align-items: center; justify-content: center; }
+  .r2-still { cursor: pointer; }
+  .r2-still img { width: 100%; height: 100%; object-fit: contain; }
+  .r2-play-hint { position: absolute; width: 54px; height: 54px; border-radius: 50%; display: flex; align-items: center;
+    justify-content: center; font-size: 22px; color: var(--cyan); background: rgba(6,10,19,0.55);
+    border: 1px solid var(--cyan-dim); opacity: 0.85; pointer-events: none; }
+  .r2-clip { z-index: 6; }
+  .r2-clip video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .r2-clip-close { position: absolute; top: 8px; right: 8px; background: rgba(6,10,19,0.7); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px; cursor: pointer; padding: 2px 8px; }
+  .cam-strip { flex-wrap: wrap; gap: 6px 12px; }
+  .r2-room-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px;
+    font-family: var(--font-mono); font-size: 9.5px; color: var(--text-dim); }
+  .r2-room-edit, .r2-row-tools button, .r2-pin button { background: transparent; border: 1px solid var(--cyan-dim);
+    color: var(--cyan); font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.1em; padding: 2px 8px;
+    border-radius: 4px; cursor: pointer; }
+  .r2-row-tools { display: inline-flex; gap: 3px; margin-left: 6px; flex-shrink: 0; }
+  .r2-row-tools button { padding: 2px 6px; border-color: var(--line); color: var(--text-dim); }
+  .r1-dev.r2-hidden-row { opacity: 0.45; }
+  .r2-pin { display: flex; gap: 6px; margin-top: 10px; }
+  .r2-pin input { flex: 1; min-width: 0; background: var(--bg-elev); border: 1px solid var(--line); color: var(--text);
+    border-radius: 4px; padding: 4px 8px; font-size: 12px; }
+  .faces-badge.flagged { background: rgba(255,77,109,0.18); color: var(--red); border-color: rgba(255,77,109,0.6); }
+  .faces-refs { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; width: 100%; }
+  .faces-refthumb { position: relative; width: 44px; height: 44px; border-radius: 4px; overflow: hidden;
+    border: 1px solid var(--line); background: var(--bg-elev); }
+  .faces-refthumb img { width: 100%; height: 100%; object-fit: cover; }
+  .faces-refthumb button { position: absolute; top: 0; right: 0; background: rgba(6,10,19,0.75); color: var(--text);
+    border: 0; font-size: 10px; line-height: 1; padding: 2px 4px; cursor: pointer; }
+  .faces-this { display: flex; flex-wrap: wrap; gap: 4px; }
+  .faces-this .faces-this-sel { flex: 1 1 100%; }
+  .faces-this .faces-this-name { flex: 1 1 60%; }
   `;
   const origStyles = P._styles;
   P._styles = function () {

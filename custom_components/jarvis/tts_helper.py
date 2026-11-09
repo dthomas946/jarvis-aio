@@ -308,6 +308,16 @@ async def async_announce(
         text = tidy_address(text)
     except Exception:
         pass
+    # ID-1 (dthomas946 fork): announcements to the house use no title unless
+    # exactly one known household member is home.
+    try:
+        from . import jarvis_config
+        from .address import rewrite_announcement
+        from .const import CONF_HONORIFIC, DEFAULT_HONORIFIC
+        _global = jarvis_config.get(CONF_HONORIFIC, DEFAULT_HONORIFIC) or DEFAULT_HONORIFIC
+        text = rewrite_announcement(hass, text, str(_global))
+    except Exception:
+        pass
 
     # Final safety net: never speak through a TV/movie player, whatever routing
     # produced this list. Logs (with context) if it has to drop one.

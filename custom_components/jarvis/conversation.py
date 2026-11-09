@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+import contextvars
 from typing import Any, Literal
 
 from homeassistant.components import conversation
@@ -102,6 +103,9 @@ except ImportError:
     _RECOGNITION_CTX = False
 
 _LOGGER = logging.getLogger(__name__)
+
+# ID-1 (dthomas946 fork): per-turn form of address (None = global honorific).
+_TURN_HONORIFIC: contextvars.ContextVar = contextvars.ContextVar("jarvis_turn_honorific", default=None)
 
 MAX_HISTORY  = 20   # messages kept in per-conversation context window
 MAX_ITERS    = 8    # max agentic tool-call iterations per request
@@ -356,6 +360,11 @@ class JarvisAgent(conversation.ConversationEntity):
         return self._opt(CONF_MODEL, DEFAULT_MODEL)
 
     def _honorific(self) -> str:
+        # ID-1/ID-2 (dthomas946 fork): a per-turn form of address, set at the
+        # start of each request from who is speaking. None = use the global one.
+        _turn = _TURN_HONORIFIC.get()
+        if _turn is not None:
+            return _turn
         return self._opt(CONF_HONORIFIC, DEFAULT_HONORIFIC)
 
     def _use_hass_api(self) -> bool:
@@ -561,7 +570,16 @@ class JarvisAgent(conversation.ConversationEntity):
             _LOGGER.debug("JARVIS: home state summary error: %s", exc)
 
         context_block = "\n\n## Current context (live data)\n" + "\n".join(ctx_parts)
-        return (base + context_block).replace("{honorific}", self._honorific())
+        _hon = self._honorific()
+        _prompt = (base + context_block).replace("{honorific}", _hon)
+        if not (_hon or "").strip():
+            _prompt += ("\n\n## Form of address\nYou don't know for certain who is "
+                        "speaking. Do not address them with any title or name "
+                        "(no 'sir', no 'ma'am').")
+        else:
+            _prompt += (f"\n\n## Form of address\nThe person speaking is addressed "
+                        f"as \"{_hon}\". Use exactly that, sparingly.")
+        return _prompt
 
     # ── Conversation history ──────────────────────────────────────────────────
 
@@ -777,6 +795,13 @@ class JarvisAgent(conversation.ConversationEntity):
         from .websocket import jarvis_log
         device_id = getattr(user_input, 'device_id', None)
         jarvis_log("CONV", f"ENTRY text='{user_input.text[:60]}' device={device_id}")
+        # ID-1/ID-2 (dthomas946 fork): who is speaking decides the form of address.
+        try:
+            from .address import honorific_for_request
+            _uid = getattr(getattr(user_input, "context", None), "user_id", None)
+            _TURN_HONORIFIC.set(await honorific_for_request(self.hass, _uid))
+        except Exception:
+            _TURN_HONORIFIC.set(None)
         _LOGGER.warning(
             "JARVIS async_process ENTRY: text='%s' device_id='%s'",
             user_input.text[:60], device_id,

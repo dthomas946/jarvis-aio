@@ -278,6 +278,10 @@ def _parse_json_obj(raw: str):
     return None
 
 
+# CAM-4 (dthomas946 fork): scene categories worth keeping as "last relevant".
+_RELEVANT_CATEGORIES = ("person", "known_resident", "vehicle", "delivery", "package", "mail")
+
+
 def _guess_detection_type(prompt: str, analysis: str) -> str:
     al = (analysis or "").lower()
     if "person" in al or "someone" in al or "individual" in al:
@@ -1497,6 +1501,11 @@ async def async_analyze_camera(
         images_b64 = [base64.b64encode(sheet).decode()]
     else:
         images_b64 = [base64.b64encode(fb).decode() for fb in frame_bytes]
+    # dthomas946 fork: the newest single frame, for face matching, sightings and
+    # the saved "last relevant" capture (a stitched contact sheet makes a poor
+    # face reference).
+    single_b64 = base64.b64encode(frame_bytes[-1]).decode() if frame_bytes else (
+        images_b64[0] if images_b64 else "")
 
     # ── Incorporate face recognition (if we know who's on camera) ──────────
     recognition_hint = _recognition_hint(hass, entity_id)
@@ -1576,7 +1585,7 @@ async def async_analyze_camera(
             from . import llm_recognition
             if images_b64:
                 hass.async_create_task(
-                    llm_recognition.identify_and_store(hass, images_b64[0], entity_id))
+                    llm_recognition.identify_and_store(hass, single_b64, entity_id))
         except Exception:
             pass
     except Exception as exc:
@@ -1641,7 +1650,7 @@ async def async_analyze_camera(
             ):
                 from . import recognition as _rec_unknown
                 hass.async_create_task(
-                    _rec_unknown.capture_unknown_snapshot(hass, entity_id, images_b64[0]))
+                    _rec_unknown.capture_unknown_snapshot(hass, entity_id, single_b64))
     except Exception:
         pass
     rsn_provider = _cfg_opt(hass, "camera_reasoning_provider", "groq") or "groq"
@@ -1707,6 +1716,20 @@ async def async_analyze_camera(
         )
     except Exception:
         pass
+    # CAM-4 (dthomas946 fork): remember the latest person / vehicle capture per
+    # camera, so Camera Watch can show "who was here" instead of the newest clip
+    # (often just the dog). Animal-only and empty scenes are skipped. Private
+    # storage; the panel reads it over the authenticated websocket.
+    try:
+        _cat = str(judgment.get("category") or "").lower()
+        if images_b64 and _cat in _RELEVANT_CATEGORIES:
+            from . import relevant_captures
+            _st = hass.states.get(entity_id)
+            _video = _st.attributes.get("last_video") if _st is not None else None
+            await hass.async_add_executor_job(
+                relevant_captures.save, entity_id, single_b64, _cat, summary, _video)
+    except Exception as _exc:
+        _LOGGER.debug("relevant capture save failed: %s", _exc)
     # Proactive-briefing snapshot record
     try:
         from .proactive_briefing import record_snapshot

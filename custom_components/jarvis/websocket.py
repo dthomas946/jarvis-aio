@@ -65,6 +65,7 @@ def async_register(hass: HomeAssistant) -> None:
         websocket_api.async_register_command(hass, ws_get_briefings)
         websocket_api.async_register_command(hass, ws_area_lights)
         websocket_api.async_register_command(hass, ws_area_devices)
+        websocket_api.async_register_command(hass, ws_camera_relevant)
         websocket_api.async_register_command(hass, ws_get_debug_log)
         websocket_api.async_register_command(hass, ws_get_cognitive_status)
         websocket_api.async_register_command(hass, ws_run_analysis)
@@ -1486,6 +1487,38 @@ async def ws_get_activity_log(
                 "msg": e.get("message", ""),
                 "source": e.get("source", "observer"),
             })
+        # ACT-3 (dthomas946 fork): conversations with JARVIS, merged in by time.
+        try:
+            from .database import get_recent_exchanges
+            from datetime import datetime as _dt2, timezone as _tz2
+            from homeassistant.util import dt as _dtu
+            for i, e in enumerate(entries):
+                if i < len(result):
+                    result[i]["_t"] = e.get("timestamp", "")
+            exchanges = await hass.async_add_executor_job(
+                lambda: get_recent_exchanges(hours=msg["hours"], limit=40))
+            for x in exchanges:
+                try:
+                    _l = _dtu.as_local(_dt2.fromisoformat(x["timestamp"]).replace(tzinfo=_tz2.utc))
+                    hh = _l.strftime("%H:%M")
+                except Exception:
+                    hh = ""
+                ans = " ".join(str(x.get("answer") or "").split())
+                if len(ans) > 160:
+                    ans = ans[:157].rstrip() + "…"
+                q = " ".join(str(x.get("question") or "").split())
+                result.append({
+                    "ts": hh, "urgency": "low", "tag": "ASSIST", "name": "You asked",
+                    "entity_id": "", "category": "conversation", "was_spoken": False,
+                    "msg": f"“{q}” → {ans or '(no reply recorded)'}",
+                    "source": "assist", "_t": x["timestamp"],
+                })
+            result.sort(key=lambda r: r.get("_t", ""), reverse=True)
+            for r in result:
+                r.pop("_t", None)
+            result = result[: max(1, int(msg["limit"]))]
+        except Exception as exc:
+            _LOGGER.debug("activity log: conversation merge failed: %s", exc)
         connection.send_result(msg["id"], {"entries": result})
     except Exception as exc:
         _LOGGER.warning("ws_get_activity_log failed: %s", exc)
@@ -1541,7 +1574,9 @@ PANEL_WRITABLE_KEYS = {
     "floor_plan_units",          # "imperial" | "metric" for room dimensions
     "floor_plan_elements",       # JSON: placed windows/doors per floor (+ sensor map)
     "panel_layout",
-    "ollama_keep_alive",         # AI-1: Ollama keep-loaded time (seconds; -1 = forever, or "30m")              # JSON: panel layout editor (section order/hidden, tab order/hidden)
+    "ollama_keep_alive",
+    "person_honorifics",         # ID-1: {"Darin": "Sir", ...} per-person form of address
+    "face_reference_limit",      # FACE-1: photos kept per person (1-4)         # AI-1: Ollama keep-loaded time (seconds; -1 = forever, or "30m")              # JSON: panel layout editor (section order/hidden, tab order/hidden)
     "floor_plan_cameras",        # JSON: placed cameras per floor (pos/angle/fov/range) (v7.17.0)
     "floor_plan_property",       # JSON: property boundary polygon {points:[[x,y],...]} (v7.22.0)
     "home_context_max_entities", # int: entity names per domain in the system prompt (0=counts only) (v7.23.1)
@@ -2761,6 +2796,31 @@ async def ws_area_lights(
         connection.send_error(msg["id"], "area_lights_failed", str(exc))
 
 
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/camera_relevant",
+    vol.Required("entity_id"): str,
+})
+@websocket_api.async_response
+async def ws_camera_relevant(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """CAM-4/5 (dthomas946 fork): the latest person / vehicle / delivery capture
+    for one camera — frame, time, category, summary and the clip URL — or null."""
+    try:
+        from . import relevant_captures
+        data = await hass.async_add_executor_job(relevant_captures.load, msg["entity_id"])
+        if data:
+            st = hass.states.get(msg["entity_id"])
+            # The clip URL Arlo signed when this capture was taken can expire;
+            # fall back to the camera's current last clip.
+            data["current_video_url"] = (st.attributes.get("last_video") if st else "") or ""
+        connection.send_result(msg["id"], {"capture": data})
+    except Exception as exc:
+        _LOGGER.warning("ws_camera_relevant failed: %s", exc)
+        connection.send_error(msg["id"], "camera_relevant_failed", str(exc))
+
 # ─── AREA-2 (dthomas946 fork): every device in a room, grouped ───────────────
 # Domains a person can act on from the room drill-in, best-first (the first one
 # a device has becomes its "primary" row control).
@@ -2788,8 +2848,9 @@ _AD_GROUP_ORDER = ["Lights", "Switches", "Irrigation", "Climate", "Locks",
 _AD_APPLIANCE_WORDS = ("cooktop", "oven", "range", "stove", "washer", "dryer",
                        "dishwasher", "fridge", "refrigerator", "freezer",
                        "microwave", "water heater")
-_AD_STATUS_HINTS = ("power state", "any burner active", "running", "status",
-                    "operating state", "state", "mode", "door", "active")
+_AD_STATUS_HINTS = ("current state", "operating state", "power state",
+                    "any burner active", "cycle", "running", "status", "cook mode",
+                    "state", "mode", "door", "active")
 
 
 def _ad_status_text(st) -> str:
@@ -2897,6 +2958,11 @@ async def ws_area_devices(
                 group = "Sensors"
             else:
                 group = "Appliances"
+            # AREA-4 (dthomas946 fork): appliances lead with their real status
+            # (oven "Current State", cooktop power state), not a setting switch
+            # such as Control Lock; the switches stay under the expand arrow.
+            if group == "Appliances" and statuses:
+                primary = statuses[0]
             if not dname:
                 dname = primary["name"]
             devices.append({
@@ -3416,10 +3482,15 @@ async def ws_intrusion(
 @websocket_api.websocket_command({
     vol.Required("type"): "jarvis/faces",
     vol.Optional("action"): vol.In(
-        ["list", "add_resident", "remove_resident", "set_reference", "remove_reference"]),
+        ["list", "add_resident", "remove_resident", "set_reference", "remove_reference",
+         # FACE-1 (dthomas946 fork)
+         "add_reference", "remove_reference_slot", "label_sighting"]),
     vol.Optional("name"): str,
     vol.Optional("image"): str,   # base64 JPEG for set_reference (#140 Phase 3)
     vol.Optional("limit"): int,
+    vol.Optional("index"): int,           # remove_reference_slot
+    vol.Optional("sighting_id"): str,     # label_sighting
+    vol.Optional("kind"): vol.In(["resident", "visitor", "delivery", "ignore", "flag"]),
 })
 @websocket_api.async_response
 async def ws_faces(
@@ -3434,7 +3505,8 @@ async def ws_faces(
         from . import recognition, face_roster
         action = msg.get("action", "list")
         if action in ("add_resident", "remove_resident", "set_reference",
-                      "remove_reference") and _deny_non_admin(connection, msg):
+                      "remove_reference", "add_reference", "remove_reference_slot",
+                      "label_sighting") and _deny_non_admin(connection, msg):
             return
         # Roster file I/O happens on the executor; the read below then runs on the
         # event loop against an already-loaded roster (no blocking file read).
@@ -3459,6 +3531,26 @@ async def ws_faces(
                                       "could not store the reference photo")
                 return
             jarvis_log("CAMERA", f"Resident reference photo set: {msg['name']}")
+        elif action == "add_reference" and msg.get("name") and msg.get("image"):
+            # FACE-1: add one more photo (close-up, full body …) instead of replacing.
+            import base64
+            try:
+                raw = base64.b64decode(str(msg["image"]).split(",", 1)[-1])
+            except Exception:
+                raw = b""
+            ok = await hass.async_add_executor_job(
+                recognition.add_face_reference, msg["name"], raw)
+            if not ok:
+                connection.send_error(msg["id"], "reference_failed",
+                                      "could not store the reference photo")
+                return
+            jarvis_log("CAMERA", f"Reference photo added for {msg['name']}")
+        elif action == "remove_reference_slot" and msg.get("name") and "index" in msg:
+            await hass.async_add_executor_job(
+                recognition.remove_face_reference_slot, msg["name"], int(msg["index"]))
+            jarvis_log("CAMERA", f"Reference photo {int(msg['index']) + 1} removed for {msg['name']}")
+        elif action == "label_sighting" and msg.get("sighting_id") and msg.get("kind"):
+            await _label_sighting(hass, msg)
         elif action == "remove_reference" and msg.get("name"):
             await hass.async_add_executor_job(recognition.remove_face_reference, msg["name"])
             jarvis_log("CAMERA", f"Resident reference photo removed: {msg['name']}")
@@ -3473,6 +3565,10 @@ async def ws_faces(
             "residents": face_roster.residents(),
             # Normalized names that have an enrolled reference photo (Phase 3).
             "references": refs,
+            # FACE-1 (dthomas946 fork): photos per person, and named visitors.
+            "reference_counts": await hass.async_add_executor_job(recognition.reference_counts),
+            "reference_limit": recognition._ref_limit(),
+            "visitors": _face_visitors(),
             # Of those, the ones auto-enrolled from a backend recognition
             # (Phase 3 training) rather than uploaded by hand.
             "auto_references": auto_refs,
@@ -3486,6 +3582,77 @@ async def ws_faces(
     except Exception as exc:
         _LOGGER.exception("ws_faces failed: %s", exc)
         connection.send_error(msg["id"], "faces_failed", str(exc))
+
+
+def _face_visitors() -> list:
+    try:
+        from . import face_sightings
+        return face_sightings.visitors()
+    except Exception:
+        return []
+
+
+async def _label_sighting(hass, msg: dict) -> None:
+    """FACE-1 "This is…": resolve one unknown sighting."""
+    from . import face_sightings, recognition, face_roster
+    from .database import save_activity
+    from homeassistant.util import dt as dt_util
+    sid = str(msg.get("sighting_id"))
+    kind = msg.get("kind")
+    name = (msg.get("name") or "").strip()
+    rows = await hass.async_add_executor_job(face_sightings.list_sightings)
+    row = next((r for r in rows if r.get("id") == sid), None)
+    if row is None:
+        return
+    cam = (row.get("camera_entity") or "").split(".", 1)[-1].replace("_", " ")
+    when = dt_util.as_local(dt_util.utc_from_timestamp(float(row.get("ts", 0)))).strftime("%H:%M")
+    if kind in ("resident", "visitor") and name:
+        jpeg = await hass.async_add_executor_job(face_sightings.read_jpeg, sid)
+        if jpeg:
+            await hass.async_add_executor_job(recognition.add_face_reference, name, jpeg)
+        if kind == "visitor" and not face_roster.is_resident(name):
+            await hass.async_add_executor_job(face_sightings.add_visitor, name)
+        await hass.async_add_executor_job(face_sightings.delete, sid)
+        jarvis_log("CAMERA", f"Sighting {sid} labelled {kind}: {name}")
+    elif kind == "delivery":
+        await hass.async_add_executor_job(face_sightings.delete, sid)
+        await hass.async_add_executor_job(lambda: save_activity(
+            entity_id=row.get("camera_entity") or "", category="delivery", urgency="low",
+            message=f"Delivery / service visit — {cam} at {when}", was_spoken=False,
+            source="faces"))
+        jarvis_log("CAMERA", f"Sighting {sid} labelled delivery/service (face not kept)")
+    elif kind == "ignore":
+        await hass.async_add_executor_job(face_sightings.delete, sid)
+    elif kind == "flag":
+        await hass.async_add_executor_job(face_sightings.flag, sid)
+        await hass.async_add_executor_job(lambda: save_activity(
+            entity_id=row.get("camera_entity") or "", category="security", urgency="high",
+            message=f"Flagged person — {cam} at {when} (marked from the Faces tab)",
+            was_spoken=False, source="faces"))
+
+
+def _read_sighting_data_url(sid: str) -> Optional[str]:
+    try:
+        from . import face_sightings
+        raw = face_sightings.read_jpeg(sid)
+        if not raw:
+            return None
+        import base64
+        return "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
+    except Exception:
+        return None
+
+
+def _read_reference_slot_data_url(name: str, index: int) -> Optional[str]:
+    try:
+        from . import recognition
+        raw = recognition.read_reference_slot(name, index)
+        if not raw:
+            return None
+        import base64
+        return "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
+    except Exception:
+        return None
 
 
 def _read_reference_data_url(name: str) -> Optional[str]:
@@ -3515,7 +3682,9 @@ def _read_reference_data_url(name: str) -> Optional[str]:
 
 @websocket_api.websocket_command({
     vol.Required("type"): "jarvis/face_reference",
-    vol.Required("name"): str,
+    vol.Optional("name"): str,
+    vol.Optional("index"): int,          # FACE-1: one photo of several
+    vol.Optional("sighting_id"): str,    # FACE-1: a private unknown-sighting frame
 })
 @websocket_api.async_response
 async def ws_face_reference(
@@ -3528,8 +3697,15 @@ async def ws_face_reference(
     it is not admin-gated — the whole Faces panel sits behind Home Assistant
     auth, and this only ever returns a photo the user themselves enrolled."""
     try:
-        data_url = await hass.async_add_executor_job(
-            _read_reference_data_url, msg["name"])
+        if msg.get("sighting_id"):
+            data_url = await hass.async_add_executor_job(
+                _read_sighting_data_url, msg["sighting_id"])
+        elif "index" in msg and msg.get("name"):
+            data_url = await hass.async_add_executor_job(
+                _read_reference_slot_data_url, msg["name"], int(msg["index"]))
+        else:
+            data_url = await hass.async_add_executor_job(
+                _read_reference_data_url, msg.get("name", ""))
         connection.send_result(msg["id"], {"image": data_url})
     except Exception as exc:
         _LOGGER.exception("ws_face_reference failed: %s", exc)

@@ -244,6 +244,36 @@ def get_recent_activity(
         return []
 
 
+def get_recent_exchanges(hours: int = 24, limit: int = 40) -> list[dict]:
+    """ACT-3 (dthomas946 fork): recent question → answer pairs from the
+    conversations table (camera summaries excluded), newest first."""
+    try:
+        since = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)).isoformat()
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT timestamp, device_id, role, content FROM conversations "
+                "WHERE timestamp > ? AND device_id != 'camera' ORDER BY timestamp ASC, id ASC",
+                (since,),
+            ).fetchall()
+        out: list[dict] = []
+        pending: dict[str, dict] = {}
+        for r in rows:
+            r = dict(r)
+            dev = r.get("device_id") or "unknown"
+            if r["role"] == "user":
+                item = {"timestamp": r["timestamp"], "device_id": dev,
+                        "question": r["content"], "answer": ""}
+                pending[dev] = item
+                out.append(item)
+            elif dev in pending and not pending[dev]["answer"]:
+                pending[dev]["answer"] = r["content"]
+        out.reverse()
+        return out[:limit]
+    except Exception as exc:
+        _LOGGER.warning("JARVIS conversation read error: %s", exc)
+        return []
+
+
 def get_activity_count_today() -> int:
     """Count of spoken announcements today."""
     try:
