@@ -154,6 +154,49 @@ _FILLER = {
 }
 
 
+_HA_ASSIST_AGENT = "conversation.home_assistant"
+
+
+async def _try_ha_assist(hass, user_input) -> str | None:
+    """Run the text through HA's built-in Assist agent. Returns its speech when
+    an intent matched and ran (action_done / query_answer), else None.
+    Never raises; never used for JARVIS-addressed chit-chat HA can't parse."""
+    try:
+        from homeassistant.components import conversation as ha_conv
+        from homeassistant.helpers import intent as ha_intent
+        res = await ha_conv.async_converse(
+            hass, user_input.text, None, user_input.context,
+            language=user_input.language, agent_id=_HA_ASSIST_AGENT,
+            device_id=getattr(user_input, "device_id", None))
+        resp = getattr(res, "response", None)
+        if resp is None:
+            return None
+        if resp.response_type not in (ha_intent.IntentResponseType.ACTION_DONE,
+                                      ha_intent.IntentResponseType.QUERY_ANSWER):
+            return None
+        data = getattr(resp, "failed_results", None)
+        if data:
+            return None
+        speech = (resp.speech or {}).get("plain", {}).get("speech", "")
+        speech = (speech or "").strip()
+        # "Turned off the switch" → "Turned off Desk Lamp" when one device ran.
+        try:
+            ok = list(getattr(resp, "success_results", None) or [])
+            if len(ok) == 1 and getattr(ok[0], "name", None):
+                import re as _re
+                speech = _re.sub(r"\bthe (switch|light|fan|lock|cover|door|"
+                                 r"garage door|blinds?|shades?|valve|outlet)\b",
+                                 ok[0].name, speech, count=1)
+        except Exception:
+            pass
+        if speech and not speech.endswith((".", "!", "?")):
+            speech += "."
+        return speech or None
+    except Exception as exc:
+        _LOGGER.debug("HA Assist pre-pass failed: %s", exc)
+        return None
+
+
 def _is_addressed_to_jarvis(text: str, strict: bool = False) -> bool:
     """
     Relevance gate: does this utterance look like it's actually addressed to
@@ -1039,10 +1082,24 @@ class JarvisAgent(conversation.ConversationEntity):
             local_result = None if _direct else await try_local(
                 self.hass, user_input.text, honorific)
 
+            # HA-1 (dthomas946 fork): when JARVIS's own engine doesn't handle it,
+            # let Home Assistant's built-in Assist intents try next ("turn the
+            # desk lamp off", "is the patio door locked") — instant, no LLM, and
+            # the same entities/aliases exposed to Assist. Only a matched intent
+            # that actually ran is used; anything else falls through to the LLM.
+            ha_text = None
+            if not (local_result and local_result.handled) and not _direct \
+                    and self._opt("ha_intents_first", True):
+                ha_text = await _try_ha_assist(self.hass, user_input)
+
             if local_result and local_result.handled:
                 response_text = local_result.text
                 _LOGGER.info("JARVIS local: %s", response_text[:100])
                 jarvis_log("LOCAL", f"handled: {response_text[:80]}")
+            elif ha_text:
+                response_text = ha_text
+                _LOGGER.info("JARVIS HA intent: %s", response_text[:100])
+                jarvis_log("LOCAL", f"Assist intent: {response_text[:80]}")
             else:
                 complexity = -1 if _direct else score_complexity(user_input.text)
                 # v5.9.06: Connectivity-aware escalation. If the circuit breaker
