@@ -1087,7 +1087,7 @@ def recent_faces(hass: HomeAssistant, limit: int = 20) -> list[dict]:
         # FACE-1 (dthomas946 fork): one row per persisted unknown sighting.
         try:
             from . import face_sightings
-            for s in face_sightings.list_sightings():
+            for s in face_sightings.cached_sightings():
                 rows[("sighting", s["id"])] = {
                     "name": "Flagged" if s.get("status") == "flagged" else "Unknown",
                     "camera_entity": s.get("camera_entity"),

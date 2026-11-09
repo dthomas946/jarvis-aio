@@ -31,6 +31,8 @@ _LOGGER = logging.getLogger(__name__)
 MAX_SIGHTINGS = 24
 MAX_AGE_S = 7 * 24 * 3600
 _lock = threading.Lock()
+# In-memory copy of the index so event-loop readers never touch the disk.
+_CACHE: list[dict] | None = None
 
 
 def _dir() -> str:
@@ -53,6 +55,8 @@ def _load() -> list[dict]:
 
 
 def _save(rows: list[dict]) -> None:
+    global _CACHE
+    _CACHE = [dict(r) for r in rows]
     path = _index_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -104,14 +108,32 @@ def add_sighting(camera_entity: str, jpeg: bytes) -> Optional[dict]:
         return None
 
 
-def list_sightings() -> list[dict]:
-    """Open sightings (new or flagged), newest first, with their served URL."""
+def warm() -> None:
+    """Load the index into memory. Executor only (file I/O)."""
+    global _CACHE
     with _lock:
-        rows = _prune(_load())
+        _CACHE = _prune(_load())
+
+
+def cached_sightings() -> list[dict]:
+    """Open sightings from memory — safe on the event loop (no file I/O).
+    Empty until :func:`warm` (or any write) has run."""
+    return _shape(list(_CACHE or []))
+
+
+def list_sightings() -> list[dict]:
+    """Open sightings (new or flagged), newest first. Executor only."""
+    warm()
+    return cached_sightings()
+
+
+def _shape(rows: list[dict]) -> list[dict]:
     now = time.time()
     out = []
-    for r in rows:
+    for r in sorted(rows, key=lambda r: r.get("ts", 0), reverse=True):
         if r.get("status") not in ("new", "flagged"):
+            continue
+        if now - float(r.get("ts", 0)) > MAX_AGE_S and r.get("status") != "flagged":
             continue
         out.append({**r, "age_seconds": int(now - float(r.get("ts", now)))})
     return out

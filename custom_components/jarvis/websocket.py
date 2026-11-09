@@ -3556,6 +3556,12 @@ async def ws_faces(
             jarvis_log("CAMERA", f"Resident reference photo removed: {msg['name']}")
         else:
             await hass.async_add_executor_job(face_roster._load)
+        # FACE-1: load the sighting index off the event loop first.
+        try:
+            from . import face_sightings as _fs
+            await hass.async_add_executor_job(_fs.warm)
+        except Exception:
+            pass
         recent = recognition.recent_faces(hass, int(msg.get("limit", 20)))
         refs = await hass.async_add_executor_job(recognition.list_face_references)
         auto_refs = await hass.async_add_executor_job(recognition.list_auto_references)
