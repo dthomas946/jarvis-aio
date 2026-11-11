@@ -1,3 +1,13 @@
+## [9.94.0] — Faces panel labels train Double Take
+
+- **"This is…" now trains Double Take too.** Naming a sighting as a resident or
+  visitor in the Faces panel also sends that picture to Double Take's training
+  API (`/api/train/add/<name>`), so CompreFace learns from JARVIS labels. Adding
+  or replacing a reference photo by hand does the same.
+- New option `doubletake_url` (e.g. `http://192.168.5.11:3000`). Empty = off.
+  Best-effort: a Double Take error is logged and never blocks the JARVIS label.
+- "Ignore" still deletes the sighting and its picture; nothing is sent.
+
 ## [9.93.2] — Arlo: one frame, no extra wait
 
 - **One frame for Arlo.** aarlo serves a single cached capture, so the 3-frame

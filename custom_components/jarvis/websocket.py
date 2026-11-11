@@ -1625,6 +1625,7 @@ PANEL_WRITABLE_KEYS = {
     "biometrics_enabled",        # bool: read wearable context (opt-in) (v6.63.0)
     "biometric_entities",        # dict: explicit kind→entity_id overrides
     "recognition_source",        # str: both | doubletake | frigate (v6.64.1)
+    "doubletake_url",            # str: Double Take base URL for training pushes (FACE-2, fork)
     "llm_face_recognition",      # bool: best-effort resident recognition via the local vision LLM, opt-in (#140 Phase 3)
     "llm_face_autotrain",        # bool: auto-enroll LLM reference photos from confident Frigate/Double Take recognitions, opt-in (#140 Phase 3 training, v9.86.0)
     "output_language",           # str: ISO code (e.g. "de") or ""/"auto" to follow HA; steers JARVIS's spoken/written output (#148)
@@ -3536,6 +3537,8 @@ async def ws_faces(
                                       "could not store the reference photo")
                 return
             jarvis_log("CAMERA", f"Resident reference photo set: {msg['name']}")
+            from . import doubletake_train
+            await doubletake_train.async_train(hass, msg["name"], raw)
         elif action == "add_reference" and msg.get("name") and msg.get("image"):
             # FACE-1: add one more photo (close-up, full body …) instead of replacing.
             import base64
@@ -3550,6 +3553,8 @@ async def ws_faces(
                                       "could not store the reference photo")
                 return
             jarvis_log("CAMERA", f"Reference photo added for {msg['name']}")
+            from . import doubletake_train
+            await doubletake_train.async_train(hass, msg["name"], raw)
         elif action == "remove_reference_slot" and msg.get("name") and "index" in msg:
             await hass.async_add_executor_job(
                 recognition.remove_face_reference_slot, msg["name"], int(msg["index"]))
@@ -3621,6 +3626,10 @@ async def _label_sighting(hass, msg: dict) -> None:
         jpeg = await hass.async_add_executor_job(face_sightings.read_jpeg, sid)
         if jpeg:
             await hass.async_add_executor_job(recognition.add_face_reference, name, jpeg)
+            # FACE-2 (fork): teach Double Take / CompreFace the same face.
+            from . import doubletake_train
+            if await doubletake_train.async_train(hass, name, jpeg):
+                jarvis_log("CAMERA", f"Sighting {sid} sent to Double Take as {name}")
         if kind == "visitor" and not face_roster.is_resident(name):
             await hass.async_add_executor_job(face_sightings.add_visitor, name)
         await hass.async_add_executor_job(face_sightings.delete, sid)
