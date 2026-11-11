@@ -1470,6 +1470,11 @@ async def async_analyze_camera(
     # media that already captured the subject) and skip live capture entirely.
     clip_frames = max(1, int(call.data.get("frames", 1) or 1))
     clip_interval = float(call.data.get("interval", 1.2) or 1.2)
+    # CAM-8 (dthomas946 fork): Arlo (aarlo) serves one cached capture, so a
+    # "clip" is the same picture three times. It also wakes an Arlo cloud
+    # stream and triples the image the GPU has to read. Use one frame.
+    if clip_frames > 1 and _is_aarlo(hass, entity_id):
+        clip_frames = 1
     if force_images:
         frame_bytes = [fb for fb in force_images if fb]
     elif clip_frames > 1:
@@ -2146,6 +2151,16 @@ async def async_visitor_observation(
         _LOGGER.info("JARVIS visitor observation on %s logged (silent)", entity_id)
 
 
+def _is_aarlo(hass: HomeAssistant, entity_id: str) -> bool:
+    """CAM-8 (dthomas946 fork): True for cameras from the aarlo integration."""
+    try:
+        from homeassistant.helpers import entity_registry as _er
+        ent = _er.async_get(hass).async_get(entity_id)
+        return ent is not None and ent.platform == "aarlo"
+    except Exception:
+        return False
+
+
 async def async_auto_analyze_on_event(
     hass: HomeAssistant,
     groq_client,
@@ -2167,7 +2182,10 @@ async def async_auto_analyze_on_event(
     learning and best-effort face recognition without adding spoken alerts. The
     recognition hook inside :func:`async_analyze_camera` fires either way.
     """
-    await asyncio.sleep(3)  # let event propagate & media become fetchable
+    # let event propagate & media become fetchable. CAM-8: Arlo motion vision
+    # already waited for the new capture, so no extra wait.
+    if not _is_aarlo(hass, entity_id):
+        await asyncio.sleep(3)
 
     if doorbell:
         await _analyze_doorbell_press(

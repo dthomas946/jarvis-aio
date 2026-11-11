@@ -1,3 +1,12 @@
+## [9.93.2] — Arlo: one frame, no extra wait
+
+- **One frame for Arlo.** aarlo serves a single cached capture, so the 3-frame
+  "clip" was the same picture three times. It also woke an Arlo cloud stream
+  and tripled the image the vision model had to read. Arlo cameras now send one
+  frame.
+- **No extra 3 s wait for Arlo.** Motion vision already waits for the new
+  capture before analysing.
+
 ## [9.93.1] — Faster Arlo camera analysis (snapshot first)
 
 - **Snapshot first on Arlo motion.** When an Arlo camera's motion sensor fires,
