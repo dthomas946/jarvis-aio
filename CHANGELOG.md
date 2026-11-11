@@ -1,3 +1,15 @@
+## [9.93.1] — Faster Arlo camera analysis (snapshot first)
+
+- **Snapshot first on Arlo motion.** When an Arlo camera's motion sensor fires,
+  JARVIS now asks aarlo for a snapshot right away instead of waiting for the
+  whole clip to finish recording and upload. Whichever image arrives first (the
+  snapshot or the clip's thumbnail) is analysed. Checks every 0.5 s instead of
+  every 2 s, with a 0.5 s settle instead of 2 s.
+- **No cloud-stream wake for Arlo.** A new `aarlo` camera backend takes aarlo's
+  cached capture as-is. Night (IR) thumbnails are often under the generic 12 KB
+  "placeholder" size, which used to start an Arlo cloud stream and wait up to
+  ~17 s for a frame that was no better.
+
 ## [9.93.0] — Fixes: Settings toggle overlap + greet only on a real return
 
 Two fixes reported from the live panel:

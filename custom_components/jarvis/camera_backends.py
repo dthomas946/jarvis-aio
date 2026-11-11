@@ -166,6 +166,37 @@ class ReolinkBackend(CameraBackend):
         return None
 
 
+# ─── Arlo (aarlo) ────────────────────────────────────────────────────────────
+
+class AarloBackend(CameraBackend):
+    """dthomas946 fork (CAM-7): Arlo battery cameras through the aarlo
+    integration. aarlo serves the camera's latest capture from its cache,
+    instantly. Those captures are small 640px thumbnails, and at night (IR,
+    grayscale) they often fall under the generic path's 12 KB "placeholder"
+    threshold, which then starts an Arlo cloud stream and waits up to ~17 s
+    for a frame that is no better. For aarlo the cached capture IS the real
+    frame, so take it as long as it isn't empty or black."""
+    name = "aarlo"
+
+    def handles(self, hass: HomeAssistant, entity_id: str) -> bool:
+        reg = er.async_get(hass)
+        entry = reg.async_get(entity_id)
+        return entry is not None and entry.platform == "aarlo"
+
+    async def fetch_best_image(self, hass, entity_id, event_cache):
+        try:
+            from homeassistant.components.camera import async_get_image
+            img = await async_get_image(hass, entity_id, timeout=10)
+            data = img.content if (img and img.content) else b""
+            if len(data) > MIN_IMAGE_SIZE:
+                from .camera import _looks_blank
+                if not _looks_blank(data):
+                    return data
+        except Exception as exc:
+            _LOGGER.debug("Aarlo cached image failed for %s: %s", entity_id, exc)
+        return None
+
+
 # ─── Registry ────────────────────────────────────────────────────────────────
 #
 # Ordered by specificity — more specific backends tried first. Generic
@@ -176,6 +207,7 @@ BACKENDS: list[CameraBackend] = [
     NestBackend(),
     UniFiProtectBackend(),
     ReolinkBackend(),
+    AarloBackend(),
 ]
 
 

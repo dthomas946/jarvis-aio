@@ -487,15 +487,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             st = hass.states.get(cam)
             marker = st.attributes.get("image_source") if st else None
             if marker is not None:
-                for _ in range(75):          # up to ~150 s
-                    await _asyncio.sleep(2)
+                # CAM-7 (dthomas946 fork): don't wait for the whole clip.
+                # The camera is already awake and recording, so ask aarlo for
+                # a snapshot right away; whichever arrives first (snapshot or
+                # the clip's thumbnail) changes image_source and is analysed.
+                # If the snapshot request fails, the clip thumbnail still
+                # arrives as before.
+                try:
+                    from homeassistant.helpers import entity_registry as _er
+                    _ent = _er.async_get(hass).async_get(cam)
+                    if (_ent is not None and _ent.platform == "aarlo"
+                            and hass.services.has_service("aarlo", "camera_request_snapshot")):
+                        await hass.services.async_call(
+                            "aarlo", "camera_request_snapshot",
+                            {"entity_id": cam}, blocking=False)
+                except Exception as exc:
+                    _LOGGER.debug("JARVIS motion vision: snapshot request failed for %s: %s",
+                                  cam, exc)
+                for _ in range(300):         # up to ~150 s, checked every 0.5 s
+                    await _asyncio.sleep(0.5)
                     cur = hass.states.get(cam)
                     if cur is not None and cur.attributes.get("image_source") != marker:
                         break
                 else:
                     _LOGGER.debug("JARVIS motion vision: no new capture on %s; skipped", cam)
                     return
-                await _asyncio.sleep(2)      # let the thumbnail settle
+                await _asyncio.sleep(0.5)    # let the image settle
             await async_auto_analyze_on_event(
                 hass, _current_client(), honorific, None, [], cam,
                 "Motion detected", doorbell=False, announce=False,
