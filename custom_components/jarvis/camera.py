@@ -1647,11 +1647,19 @@ async def async_analyze_camera(
     # fire-and-forget; its cache never feeds intrusion, and a named recognition
     # for this camera suppresses the unknown row (see recognition.recent_faces).
     try:
-        if images_b64 and _cfg_opt(hass, "llm_face_recognition", False):
+        # FACE-3 (dthomas946 fork): surface EVERY person sighting for review,
+        # whatever the face-recognition source (it used to need the LLM face
+        # check on, so switching to Double Take silently stopped all cards).
+        # Wider word list, since a small vision model often says "figure" or
+        # "silhouette" rather than "person".
+        if images_b64:
             import re as _re_person
             if _re_person.search(
-                r"\b(person|someone|somebody|individual|man|woman|men|women|"
-                r"people|child|children|boy|girl|human|face|intruder)\b",
+                r"\b(person|persons|someone|somebody|individual|individuals|man|woman|"
+                r"men|women|people|child|children|kid|kids|boy|girl|human|humans|face|"
+                r"intruder|figure|figures|silhouette|silhouettes|pedestrian|visitor|"
+                r"visitors|worker|workers|driver|courier|adult|adults|teen|teenager|"
+                r"guy|lady|stranger|resident|someone's)\b",
                 (analysis or "").lower(),
             ):
                 from . import recognition as _rec_unknown

@@ -1,3 +1,17 @@
+## [9.94.1] — Every person sighting shows up for review
+
+- **Unknown-person cards no longer depend on the LLM face check.** They were
+  only created while `llm_face_recognition` was on, so switching recognition to
+  Double Take silently stopped them. Now every motion analysis that sees a
+  person adds a card to the Faces panel.
+- **Wider person-word match.** A small vision model often says "figure",
+  "silhouette", "pedestrian", "driver" and so on. Those now count as a person.
+- **No 2-minute throttle on cards.** Every new picture becomes its own card.
+  Only an identical picture (the same Arlo capture analysed twice) is skipped.
+- **Motion vision debounce 120 s → 45 s** per camera, so a second visit soon
+  after the first is still analysed.
+- **Up to 100 cards kept** (was 24), still 7 days max. The panel shows up to 100.
+
 ## [9.94.0] — Faces panel labels train Double Take
 
 - **"This is…" now trains Double Take too.** Naming a sighting as a resident or

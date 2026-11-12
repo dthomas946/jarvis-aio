@@ -433,7 +433,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Default OFF, throttled per-camera, so it never spams the vision model or
     # adds announcements unless the user turns it on.
     _motion_vision_cd: dict[str, float] = {}
-    MOTION_VISION_DEBOUNCE = 120.0
+    MOTION_VISION_DEBOUNCE = 45.0  # FACE-3 (fork): was 120 s; an Arlo clip is ~20-30 s
     _MOTION_CLASSES = ("motion", "occupancy", "presence", "moving")
 
     def _camera_covering_area(area_id: str) -> str | None:

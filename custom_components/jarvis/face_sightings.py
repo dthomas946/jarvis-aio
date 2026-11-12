@@ -28,7 +28,7 @@ from typing import Optional
 
 _LOGGER = logging.getLogger(__name__)
 
-MAX_SIGHTINGS = 24
+MAX_SIGHTINGS = 100  # FACE-3 (fork): was 24
 MAX_AGE_S = 7 * 24 * 3600
 _lock = threading.Lock()
 # In-memory copy of the index so event-loop readers never touch the disk.

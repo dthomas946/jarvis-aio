@@ -840,16 +840,21 @@ async def capture_unknown_snapshot(hass, camera: str, image_b64: str) -> Optiona
         cam0 = str(camera or "")
         entity_id = cam0 if cam0.startswith("camera.") else _camera_entity_from_name(cam0)
         prev = _UNKNOWN_FACE_CACHE.get(entity_id)
-        if (prev and prev.get("url")
-                and (_time.time() - prev.get("mono", 0)) < _UNKNOWN_SNAP_THROTTLE):
-            # Re-stamp freshness without rewriting the file, and keep the URL.
-            remember_unknown_face(entity_id, prev.get("url"))
-            return prev.get("url")
         if not image_b64:
             remember_unknown_face(entity_id, None)
             return None
         import base64
+        import hashlib
         content = base64.b64decode(image_b64)
+        # FACE-3 (dthomas946 fork): every NEW picture becomes a reviewable
+        # sighting. Only an identical picture (the same cached Arlo capture
+        # analysed twice) is skipped. The old 120 s per-camera throttle dropped
+        # real visits that came close together.
+        digest = hashlib.sha1(content).hexdigest()
+        if prev and prev.get("digest") == digest:
+            remember_unknown_face(entity_id, prev.get("url"))
+            _UNKNOWN_FACE_CACHE[entity_id]["digest"] = digest
+            return prev.get("url")
         try:
             from .camera import _downscale_jpeg
             content = _downscale_jpeg(content, 480)
@@ -862,6 +867,7 @@ async def capture_unknown_snapshot(hass, camera: str, image_b64: str) -> Optiona
         await hass.async_add_executor_job(_store_face_snapshot, path, content)
         url = f"{FACE_SNAPSHOT_URL_BASE}/{key}.jpg"
         remember_unknown_face(entity_id, url)
+        _UNKNOWN_FACE_CACHE[entity_id]["digest"] = digest
         # FACE-1 (dthomas946 fork): keep a labelable history of unknown sightings.
         try:
             from . import face_sightings

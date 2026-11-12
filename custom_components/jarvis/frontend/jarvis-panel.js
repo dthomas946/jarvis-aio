@@ -9285,7 +9285,7 @@ ${this._renderExcludedEntities(d)}
   async _fetchFaces() {
     if (!this._hass) return;
     try {
-      this._faces = await this._hass.callWS({ type: "jarvis/faces", action: "list", limit: 24 });
+      this._faces = await this._hass.callWS({ type: "jarvis/faces", action: "list", limit: 100 });
     } catch (_) {
       this._faces = { error: true };
     }
