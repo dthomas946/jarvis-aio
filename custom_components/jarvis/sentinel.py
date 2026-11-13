@@ -54,6 +54,18 @@ DEFAULT_RULES = [
         "message": "{honorific}, {friendly_name} has been open for {minutes} minutes.",
     },
     {
+        # SENT-1 (fork): garage doors exposed as cover entities (ratgdo, MyQ,
+        # ESPHome…) carry device_class "garage" and never matched the
+        # binary_sensor garage_door rule above, so they had no left-open
+        # reminder at all. Same cadence as a door: 10 min, repeating.
+        "id": "garage_cover_left_open",
+        "domain": "cover",
+        "device_class": "garage",
+        "state": "open",
+        "for_minutes": 10,
+        "message": "{honorific}, {friendly_name} has been open for {minutes} minutes.",
+    },
+    {
         "id": "lock_unlocked",
         "domain": "lock",
         "state": "unlocked",
