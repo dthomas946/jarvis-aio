@@ -567,6 +567,39 @@ class SafetyManager:
         envelope, so anything garage-named stays in."""
         from . import outdoor
 
+        # NIGHT-3 (fork): never seed a breach from an entity the owner has
+        # excluded from JARVIS or put on sentinel_ignore_entities (a broken
+        # opener that always reports open, an appliance door, an interior lock).
+        skip: set[str] = set()
+        try:
+            raw = None
+            from .const import DOMAIN as _DOM
+            for _eid, _data in (self.hass.data.get(_DOM, {}) or {}).items():
+                if isinstance(_data, dict) and "sentinel_ignore_entities" in _data.get("runtime_config", {}):
+                    raw = _data["runtime_config"]["sentinel_ignore_entities"]
+                    break
+            if raw is None:
+                raw = self.config.get("sentinel_ignore_entities", []) or []
+            if isinstance(raw, str):
+                raw = [x.strip() for x in raw.replace("\n", ",").split(",")]
+            skip = {str(x).strip() for x in raw if str(x).strip()}
+        except Exception:
+            skip = set()
+        try:
+            from .entity_filter import is_excluded as _is_excluded
+        except Exception:  # pragma: no cover
+            _is_excluded = None
+
+        def _ignored(eid: str) -> bool:
+            if eid in skip:
+                return True
+            if _is_excluded is not None:
+                try:
+                    return bool(_is_excluded(self.hass, eid))
+                except Exception:
+                    return False
+            return False
+
         def _envelope(st) -> bool:
             fname = st.attributes.get("friendly_name") or ""
             if "garage" in (st.entity_id + " " + fname).lower():
@@ -575,11 +608,11 @@ class SafetyManager:
 
         for st in self.hass.states.async_all("binary_sensor"):
             if (st.attributes.get("device_class") in ("door", "window", "garage_door", "opening")
-                    and st.state == "on" and _envelope(st)):
+                    and st.state == "on" and not _ignored(st.entity_id) and _envelope(st)):
                 return st.entity_id
         for st in self.hass.states.async_all("cover"):
             if (st.attributes.get("device_class") in ("door", "garage", "garage_door", "gate")
-                    and st.state in ("open", "opening") and _envelope(st)):
+                    and st.state in ("open", "opening") and not _ignored(st.entity_id) and _envelope(st)):
                 return st.entity_id
         return None
 
