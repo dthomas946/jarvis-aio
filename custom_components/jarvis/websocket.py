@@ -1580,6 +1580,10 @@ PANEL_WRITABLE_KEYS = {
     "camera_push_alerts",        # CAM-6: phone alert for driveway car / unknown person / delivery
     "camera_push_cooldown",      # CAM-6: seconds between alerts per camera + kind
     "sentinel_ignore_entities",  # NOTIF-1: no left-open/unlocked reminders for these (interior locks)
+    "quiet_hours_entry_critical",  # NIGHT-1: door/garage/lock changes are critical during quiet hours/sleep
+    "intrusion_night_start",     # NIGHT-2: intrusion night watch window start "HH:MM" ("" = off)
+    "intrusion_night_end",       # NIGHT-2: intrusion night watch window end "HH:MM"
+    "briefing_push_phone",       # BRIEF-1: push scheduled/manual briefings to notify_service
     "briefing_energy_cost_entity",  # ENERGY-1: sensor with yesterday's electricity cost ("" = off)
     "ha_intents_first",  # HA-1: try Home Assistant Assist intents before the LLM (default on)
     "floor_plan_cameras",        # JSON: placed cameras per floor (pos/angle/fov/range) (v7.17.0)

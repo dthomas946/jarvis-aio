@@ -370,8 +370,14 @@ class SafetyManager:
                     actions.append(intrusion)
             elif self._investigation is not None:
                 self._investigation = None  # confinement off → stop immediately
-        elif self._residents_away() or sleeping or self._investigation is not None:
-            intrusion = await self._check_intrusion(anyone_home, sleeping)
+        elif (self._residents_away() or sleeping or self._investigation is not None
+              or _intrusion_night_watch(self.config)):
+            # NIGHT-2 (fork): a fixed night window (intrusion_night_start/end,
+            # default 19:00–07:00) arms entry detection like sleep does, whether
+            # or not anyone is tracked home or asleep.
+            self._night_watch = (not sleeping) and _intrusion_night_watch(self.config)
+            intrusion = await self._check_intrusion(
+                anyone_home, sleeping or self._night_watch)
             if intrusion:
                 actions.append(intrusion)
 
@@ -1095,12 +1101,14 @@ class SafetyManager:
             self._last_intrusion_alert = now
             # Under breach-only the seed is a real breach/person, not bare motion,
             # so phrase it as a possible entry rather than "motion detected".
+            _when = ("during the night watch" if getattr(self, "_night_watch", False)
+                     else "while the household is asleep")
             if self.config.get("intrusion_breach_only", True):
                 msg = (f"{honorific.title()}, a possible entry was detected at "
-                       f"{where} while the household is asleep. Investigating.")
+                       f"{where} {_when}. Investigating.")
             else:
                 msg = (f"{honorific.title()}, motion detected at {where} "
-                       f"while the household is asleep. Investigating.")
+                       f"{_when}. Investigating.")
             self._log_standdown_reason(where)
             return {
                 "type": "intrusion_sleep", "urgency": "high",
@@ -4329,6 +4337,21 @@ async def _emit_action(hass, config, action, sleeping):
 
     except Exception as exc:
         _LOGGER.warning("Cognitive: action routing failed: %s", exc)
+
+
+def _intrusion_night_watch(config: dict) -> bool:
+    """NIGHT-2 (fork): True while the local time is inside the intrusion night
+    window. Keys ``intrusion_night_start`` / ``intrusion_night_end`` ("HH:MM";
+    default 19:00 → 07:00). Set either to "" to disable the window."""
+    try:
+        from . import sleep_detection
+        start = str((config or {}).get("intrusion_night_start", "19:00") or "").strip()
+        end = str((config or {}).get("intrusion_night_end", "07:00") or "").strip()
+        if not start or not end:
+            return False
+        return bool(sleep_detection._in_quiet_hours(start, end))
+    except Exception:
+        return False
 
 
 def is_lockdown() -> bool:

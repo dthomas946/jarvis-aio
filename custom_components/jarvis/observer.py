@@ -791,6 +791,33 @@ async def _process_event(event: Event) -> None:
             if not approved:
                 decision = {"speak": False, "reason": "review tier veto"}
 
+        # NIGHT-1 (fork): an entry point (door / garage / lock) changing during
+        # quiet hours or sleep is always critical — it is never held, downgraded
+        # or left to the reasoning tier's discretion, so the phone push goes out
+        # every time. Entities excluded from JARVIS or on sentinel_ignore_entities
+        # (interior locks, appliance doors) keep the normal path.
+        _entry_critical = False
+        if (in_quiet_hours or sleeping) and _quiet_hours_entry_critical():
+            _entry_critical = _is_entry_point(entity_id, new_state)
+        if _entry_critical:
+            _verb = _entry_verb(new_state.state)
+            if not decision.get("speak") or not decision.get("message"):
+                decision = {
+                    "speak": True, "urgency": "critical",
+                    "message": f"{_STATE.config.get(CONF_HONORIFIC, 'sir').title()}, "
+                               f"{friendly_name} {_verb} during quiet hours.",
+                    "reason": "entry point changed during quiet hours",
+                }
+            else:
+                decision = dict(decision)
+                decision["urgency"] = "critical"
+            urgency_hint = "critical"
+            try:
+                from .websocket import jarvis_log
+                jarvis_log("GATE", f"quiet hours — {friendly_name} {_verb}: forced critical (NIGHT-1)")
+            except Exception:
+                pass
+
         if not decision.get("speak"):
             _LOGGER.debug(
                 "Observer silent for %s: %s",
@@ -970,6 +997,76 @@ def _is_announcements_enabled() -> bool:
                 return bool(rc["announcements_enabled"])
     # Fall back to _STATE.config (from addon config / entry options)
     return bool((_STATE.config or {}).get("announcements_enabled", True))
+
+
+_ENTRY_BINARY_CLASSES = ("door", "garage_door", "window", "opening")
+_ENTRY_COVER_CLASSES = ("garage", "door", "gate")
+
+
+def _is_entry_point(entity_id: str, new_state) -> bool:
+    """NIGHT-1: is this a lock, a door/garage/gate cover, or a door/window/garage
+    binary sensor — and not excluded from JARVIS or on sentinel_ignore_entities?"""
+    try:
+        domain = entity_id.split(".", 1)[0]
+        dc = (getattr(new_state, "attributes", {}) or {}).get("device_class") or ""
+        if domain == "lock":
+            hit = True
+        elif domain == "cover":
+            hit = dc in _ENTRY_COVER_CLASSES
+        elif domain == "binary_sensor":
+            hit = dc in _ENTRY_BINARY_CLASSES
+        else:
+            hit = False
+        if not hit:
+            return False
+        try:
+            from .entity_filter import is_excluded
+            if is_excluded(_STATE.hass, entity_id):
+                return False
+        except Exception:
+            pass
+        raw = None
+        try:
+            from .const import DOMAIN as _D
+            for _eid, data in (_STATE.hass.data.get(_D, {}) or {}).items():
+                if isinstance(data, dict) and "sentinel_ignore_entities" in data.get("runtime_config", {}):
+                    raw = data["runtime_config"]["sentinel_ignore_entities"]
+                    break
+        except Exception:
+            raw = None
+        if raw is None:
+            raw = (_STATE.config or {}).get("sentinel_ignore_entities", []) or []
+        if isinstance(raw, str):
+            raw = [x.strip() for x in raw.replace("\n", ",").split(",")]
+        return entity_id not in {str(x).strip() for x in raw if str(x).strip()}
+    except Exception:
+        return False
+
+
+def _entry_verb(state: str) -> str:
+    s = str(state or "").lower()
+    return {"on": "opened", "open": "opened", "opening": "is opening",
+            "off": "closed", "closed": "closed", "closing": "is closing",
+            "unlocked": "unlocked", "locked": "locked",
+            "unlocking": "is unlocking", "locking": "is locking",
+            "jammed": "is jammed"}.get(s, f"changed to {s}")
+
+
+def _quiet_hours_entry_critical() -> bool:
+    """NIGHT-1 (fork): treat door / garage / lock changes as critical during quiet
+    hours or sleep (default ON). Config key ``quiet_hours_entry_critical``."""
+    from .const import DOMAIN
+    hass = _STATE.hass
+    try:
+        if hass:
+            for _eid, data in hass.data.get(DOMAIN, {}).items():
+                if isinstance(data, dict):
+                    rc = data.get("runtime_config", {})
+                    if "quiet_hours_entry_critical" in rc:
+                        return bool(rc["quiet_hours_entry_critical"])
+        return bool((_STATE.config or {}).get("quiet_hours_entry_critical", True))
+    except Exception:
+        return True
 
 
 def _quiet_push_critical_only() -> bool:

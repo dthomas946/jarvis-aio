@@ -413,5 +413,48 @@ async def async_briefing(
             await async_announce(hass, briefing_text, tts_entity, speakers)
             announced = True
 
+    # BRIEF-1 (fork): also push the briefing to the phone (config
+    # ``briefing_push_phone``, default ON) so it arrives even with no speakers.
+    pushed = False
+    if briefing_text and _briefing_push_phone(hass):
+        pushed = await _push_briefing(hass, briefing_text, greeting)
+
     return {"success": True, "briefing": briefing_text, "context": context,
-            "announced": announced}
+            "announced": announced, "pushed": pushed}
+
+
+def _briefing_push_phone(hass: HomeAssistant) -> bool:
+    try:
+        from . import jarvis_config
+        from .const import DOMAIN
+        entries = hass.config_entries.async_entries(DOMAIN)
+        if entries:
+            return bool(jarvis_config.runtime_get(
+                hass, entries[0], "briefing_push_phone", True))
+    except Exception:
+        pass
+    return True
+
+
+async def _push_briefing(hass: HomeAssistant, text: str, greeting: str) -> bool:
+    """Send the briefing text to the configured notify_service. Best-effort."""
+    try:
+        from . import jarvis_config
+        from .const import DOMAIN
+        entries = hass.config_entries.async_entries(DOMAIN)
+        notify_svc = jarvis_config.runtime_get(
+            hass, entries[0], "notify_service", "") if entries else ""
+        if not notify_svc or "." not in str(notify_svc):
+            return False
+        domain, service = str(notify_svc).split(".", 1)
+        title = "JARVIS \u2014 Briefing"
+        await hass.services.async_call(
+            domain, service,
+            {"title": title, "message": text,
+             "data": {"url": "/jarvis", "tag": "jarvis_briefing"}},
+            blocking=False,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.debug("JARVIS briefing phone push failed: %s", exc)
+        return False
